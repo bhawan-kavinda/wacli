@@ -446,6 +446,7 @@ func runTUI(b Backend) error {
 		lipgloss.SetColorProfile(termenv.TrueColor) // Termux supports 24-bit colour
 	}
 	applyTheme(loadConfig().Theme)
+	roundCaps = loadConfig().RoundedCaps || os.Getenv("WACLI_ROUNDED") != ""
 	ti := textinput.New()
 	ti.Prompt = "❯ "
 	ti.Placeholder = "Type a message…  (/help)"
@@ -2000,6 +2001,29 @@ func (m *tuiModel) chipLayout(w int) []tabPos {
 	return out
 }
 
+// roundCaps turns the pills (search box, filter chips, unread badge) into smooth rounded
+// shapes using the Powerline half-circle glyphs. Needs a Nerd Font / Powerline-patched font
+// in the terminal, so it is opt-in:  wacli config set rounded_caps true   (or WACLI_ROUNDED=1)
+var roundCaps bool
+
+const (
+	capLeft  = "\ue0b6" // left half circle
+	capRight = "\ue0b4" // right half circle
+)
+
+// pillCap is one rounded end of a pill coloured c; without roundCaps it is a plain padding
+// cell of the pill colour, so the pill stays a clean solid block.
+func pillCap(left bool, c lipgloss.Color) seg {
+	if !roundCaps {
+		return seg{t: " ", bg: c}
+	}
+	g := capRight
+	if left {
+		g = capLeft
+	}
+	return seg{t: g, fg: c, bg: th.bg}
+}
+
 // glyphRow paints raw block glyphs (fg colour on the page background) - used for the
 // rounded edges of the search pill.
 func glyphRow(w int, fg lipgloss.Color, s string) string {
@@ -2032,22 +2056,40 @@ func (m *tuiModel) topBar(w int) []string {
 	if iw := w - 2; iw < 6 {
 		rows[1], rows[2], rows[3] = blankRow(w), blankRow(w), blankRow(w)
 	} else {
-		rows[1] = blankRow(1) + render(th.bar, iw) + blankRow(1) // solid pill, no half-block glyphs
-		var mid string
-		if m.filtering {
-			v := m.filter.View()
-			mid = blankRow(1) + v
-			if pad := iw - lipgloss.Width(v); pad > 0 {
-				mid += render(th.bar, pad)
+		if roundCaps {
+			// one smooth row: half-circle cap + body + half-circle cap
+			rows[1], rows[3] = blankRow(w), blankRow(w)
+			bw := iw - 2
+			var mid string
+			if m.filtering {
+				v := m.filter.View()
+				mid = v
+				if pad := bw - lipgloss.Width(v); pad > 0 {
+					mid += render(th.bar, pad)
+				}
+			} else {
+				mid = render(th.bar, bw, seg{t: trunc(" 🔍  Search chats, contacts, messages", bw), fg: th.dim})
 			}
-			mid += blankRow(1)
+			rows[2] = blankRow(1) + render(th.bg, 1, pillCap(true, th.bar)) + mid +
+				render(th.bg, 1, pillCap(false, th.bar)) + blankRow(1)
 		} else {
-			mid = blankRow(1) +
-				render(th.bar, iw, seg{t: trunc("  🔍  Search chats, contacts, messages", iw), fg: th.dim}) +
-				blankRow(1)
+			rows[1] = blankRow(1) + render(th.bar, iw) + blankRow(1) // solid pill, no half-block glyphs
+			var mid string
+			if m.filtering {
+				v := m.filter.View()
+				mid = blankRow(1) + v
+				if pad := iw - lipgloss.Width(v); pad > 0 {
+					mid += render(th.bar, pad)
+				}
+				mid += blankRow(1)
+			} else {
+				mid = blankRow(1) +
+					render(th.bar, iw, seg{t: trunc("  🔍  Search chats, contacts, messages", iw), fg: th.dim}) +
+					blankRow(1)
+			}
+			rows[2] = mid
+			rows[3] = blankRow(1) + render(th.bar, iw) + blankRow(1)
 		}
-		rows[2] = mid
-		rows[3] = blankRow(1) + render(th.bar, iw) + blankRow(1)
 	}
 
 	// row 4: filter chips with rounded caps
@@ -2062,9 +2104,9 @@ func (m *tuiModel) topBar(w int) []string {
 			chipBg, fg, bold = th.me, th.accent, true
 		}
 		segs = append(segs,
-			seg{t: " ", bg: chipBg},
+			pillCap(true, chipBg),
 			seg{t: p.label, fg: fg, bg: chipBg, bold: bold},
-			seg{t: " ", bg: chipBg})
+			pillCap(false, chipBg))
 		cur = p.x1
 	}
 	rows[4] = bgr(w, segs...)
@@ -2497,9 +2539,9 @@ func (m *tuiModel) listCard(c Chat, selected bool, w int) [itemRows]string {
 	tail := []seg{}
 	if badgeW > 0 {
 		tail = append(tail,
-			seg{t: " ", bg: th.accent},
+			pillCap(true, th.accent),
 			seg{t: badge, fg: th.bg, bg: th.accent, bold: true},
-			seg{t: " ", bg: th.accent})
+			pillCap(false, th.accent))
 	}
 	if badgeW > 0 && pinW > 0 {
 		tail = append(tail, seg{t: " "})

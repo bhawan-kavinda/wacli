@@ -652,7 +652,7 @@ func cmdConfig(args []string) error {
 		return printJSON(cfg)
 	}
 	if args[0] != "set" || len(args) < 3 {
-		return errors.New("usage: wacli config [set <notifications|send_read_receipts|send_typing|download_dir> <value>]")
+		return errors.New("usage: wacli config [set <notifications|send_read_receipts|send_typing|rounded_caps|download_dir> <value>]")
 	}
 	val := strings.Join(args[2:], " ")
 	var err error
@@ -663,6 +663,8 @@ func cmdConfig(args []string) error {
 		cfg.SendReceipts, err = parseBool(val)
 	case "send_typing":
 		cfg.SendTyping, err = parseBool(val)
+	case "rounded_caps":
+		cfg.RoundedCaps, err = parseBool(val)
 	case "download_dir":
 		cfg.DownloadDir = expandHome(val)
 	default:

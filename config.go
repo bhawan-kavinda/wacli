@@ -13,6 +13,7 @@ type Config struct {
 	DownloadDir   string            `json:"download_dir"`
 	Theme         string            `json:"theme"`
 	Aliases       map[string]string `json:"aliases"`
+	RoundedCaps   bool              `json:"rounded_caps"` // smooth rounded pills (needs a Nerd Font / Powerline font)
 	Pinned        []string          `json:"pinned"` // chat JIDs pinned (★) to the top of the TUI list
 }
 
