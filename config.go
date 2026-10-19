@@ -11,6 +11,7 @@ type Config struct {
 	SendReceipts  bool              `json:"send_read_receipts"`
 	SendTyping    bool              `json:"send_typing"`
 	DownloadDir   string            `json:"download_dir"`
+	Theme         string            `json:"theme"`
 	Aliases       map[string]string `json:"aliases"`
 }
 
@@ -43,6 +44,7 @@ func loadConfig() *Config {
 		SendReceipts:  true,
 		SendTyping:    true,
 		DownloadDir:   defaultDownloadDir(),
+		Theme:         "whatsapp",
 		Aliases:       map[string]string{},
 	}
 	if b, err := os.ReadFile(configPath()); err == nil {
