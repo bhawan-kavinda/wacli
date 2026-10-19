@@ -1456,6 +1456,9 @@ func (m *tuiModel) layoutMsgs(w int) msgLayout {
 			prevDay = day
 		}
 		tail := newDay || mm.Sender != prevSender || mm.TS-prevTS > 300
+		if i > 0 && !newDay {
+			lay.lines = append(lay.lines, blankRow(w)) // one empty row between every two messages
+		}
 		lay.start[i] = len(lay.lines)
 		lay.lines = append(lay.lines, m.bubble(mm, w, group, i == m.selMsg, tail, byID)...)
 		lay.end[i] = len(lay.lines)
@@ -1471,8 +1474,8 @@ func centerPill(text string, w int) string {
 		seg{t: t, fg: th.dim, bg: th.pill})
 }
 
-// bubble draws one WhatsApp-style message: rounded corners (quadrant/half blocks),
-// own messages on the right, a sharp "tail" corner on the first message of a run.
+// bubble draws one WhatsApp-style message: seamless rounded corners (plain coloured
+// cells), own messages on the right, a sharp "tail" corner on the first message of a run.
 func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID map[string]Message) []string {
 	maxInner := clamp(w*75/100-2, 14, max(14, w-6))
 	bb := th.them
@@ -1566,22 +1569,13 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID ma
 	}
 
 	total := inner + 2
-	tl, tr := "▗", "▖"
-	if tail {
-		if mm.FromMe {
-			tr = "▄"
-		} else {
-			tl = "▄"
-		}
-	}
-	edge := func(l, mid, r string) []seg {
-		return []seg{
-			{t: l, fg: bb, bg: th.bg},
-			{t: strings.Repeat(mid, total-2), fg: bb, bg: th.bg},
-			{t: r, fg: bb, bg: th.bg},
-		}
-	}
-	cores := [][]seg{edge(tl, "▄", tr)}
+
+	// Plain rectangular bubble made only of background-coloured cells (no half/quadrant
+	// block glyphs - Termux fonts draw visible seams with those). One padding row on
+	// top, none at the bottom, so a one-line message is 2 rows tall (2 selection bars).
+	topRow := []seg{{t: spaces(total), bg: bb}}
+
+	cores := [][]seg{topRow}
 	for _, r := range rows {
 		line := []seg{{t: " ", bg: bb}}
 		for _, s := range r {
@@ -1599,7 +1593,6 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID ma
 		line = append(line, seg{t: " ", bg: bb})
 		cores = append(cores, line)
 	}
-	cores = append(cores, edge("▝", "▀", "▘"))
 
 	lead := " "
 	if mm.FromMe {
