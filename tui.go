@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -400,6 +402,18 @@ type tuiModel struct {
 	typingIn map[string]time.Time // chats where someone is typing right now (list preview)
 	pinned   map[string]bool      // pinned chats (★), saved in config.json
 
+	// file browser (the 📁 button): browse the download folder, open or send a file
+	showFiles bool
+	fStage    int // 0 file list · 1 open/send · 2 pick a chat · 3 confirm
+	fDir      string
+	fItems    []fileItem
+	fSel      int
+	fFile     fileItem
+	fchats    []Chat
+	fcSel     int
+	ffilter   textinput.Model
+	fTarget   Chat
+
 	status string
 	events <-chan Event
 	cancel func()
@@ -416,6 +430,9 @@ func (m *tuiModel) restyle() {
 	m.cfilter.PromptStyle = m.input.PromptStyle
 	m.cfilter.TextStyle = m.input.TextStyle
 	m.cfilter.PlaceholderStyle = m.input.PlaceholderStyle
+	m.ffilter.PromptStyle = m.input.PromptStyle
+	m.ffilter.TextStyle = m.input.TextStyle
+	m.ffilter.PlaceholderStyle = m.input.PlaceholderStyle
 }
 
 func runTUI(b Backend) error {
@@ -435,7 +452,11 @@ func runTUI(b Backend) error {
 	ci.Prompt = "🔍 "
 	ci.Placeholder = "name or number"
 
-	m := &tuiModel{be: b, input: ti, filter: fi, cfilter: ci, selMsg: -1,
+	ffi := textinput.New()
+	ffi.Prompt = "🔍 "
+	ffi.Placeholder = "send to… (name)"
+
+	m := &tuiModel{be: b, input: ti, filter: fi, cfilter: ci, ffilter: ffi, selMsg: -1,
 		typingIn: map[string]time.Time{}, pinned: map[string]bool{}, drafts: loadDrafts()}
 	for _, j := range loadConfig().Pinned {
 		m.pinned[j] = true
@@ -583,6 +604,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.Width = max(8, m.paneWidths()[1]-4)
 		m.filter.Width = max(8, m.paneWidths()[0]-6)
 		m.cfilter.Width = max(8, m.paneWidths()[0]-6)
+		m.ffilter.Width = max(8, msg.Width-6)
 	case contactsMsg:
 		var out []Contact
 		for _, c := range []Contact(msg) {
@@ -987,6 +1009,9 @@ func (m *tuiModel) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.quit()
 	}
 	m.status = ""
+	if m.showFiles {
+		return m.onFilesKey(k, s)
+	}
 	if m.showHelp {
 		m.showHelp = false
 		return m, nil
@@ -1086,6 +1111,8 @@ func (m *tuiModel) onListKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		return m, m.openContacts()
 	case "d":
 		m.showDash = true
+	case "f":
+		return m, m.openFiles()
 	case "t":
 		m.cycleTheme()
 	case "enter":
@@ -1391,6 +1418,9 @@ func (m *tuiModel) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	}
+	if m.showFiles {
+		return m.onFilesMouse(msg)
+	}
 	lw, rw, rx0 := m.paneSplit()
 	inLeft := lw > 0 && msg.X < lw
 	inRight := rw > 0 && msg.X >= rx0
@@ -1459,6 +1489,9 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 			if x < contactsBtnW+2 {
 				return m, m.openContacts()
 			}
+			if x >= filesBtnX && x < filesBtnX+filesBtnW {
+				return m, m.openFiles()
+			}
 		case y >= 2 && y < h-2:
 			perPage, top := m.resGeom(h)
 			slot := (y - 2) / 2
@@ -1481,6 +1514,9 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 	case y == h-2:
 		if x < contactsBtnW+2 {
 			return m, m.openContacts()
+		}
+		if x >= filesBtnX && x < filesBtnX+filesBtnW {
+			return m, m.openFiles()
 		}
 	case y >= 2 && y < h-2:
 		perPage, top := m.listGeom(h)
@@ -1716,6 +1752,9 @@ func (m *tuiModel) View() string {
 	if m.showDash {
 		return m.renderDashScreen()
 	}
+	if m.showFiles {
+		return m.renderFiles()
+	}
 	pw := m.paneWidths()
 	lw, rw := pw[0], pw[1]
 	var left, right []string
@@ -1762,6 +1801,7 @@ func (m *tuiModel) renderHelp() string {
 	line("u", "unread tab on / off")
 	line("p", "pin / unpin chat ★")
 	line("c  or  n", "contacts · new chat")
+	line("f", "files · open / send a download")
 	line("d", "home dashboard")
 	line("t", "next theme")
 	line("j k  ↑ ↓", "move")
@@ -1770,6 +1810,7 @@ func (m *tuiModel) renderHelp() string {
 	blank()
 	title("Touch")
 	line("tap", "open chat · tab · button")
+	line("tap 📁", "browse files · open or send")
 	line("swipe", "scroll list or messages")
 	line("tap message", "pick it (reply, react…)")
 	blank()
@@ -1931,11 +1972,11 @@ func (m *tuiModel) renderList(w, h int) []string {
 		rows[r], rows[r+1] = m.listItem(m.shown[idx], idx == m.sel, w)
 	}
 	// WhatsApp-style "new chat" button, bottom left
-	rows[h-2] = bgr(w, seg{t: " "}, seg{t: " + Contacts ", fg: th.bg, bg: th.accent, bold: true})
+	rows[h-2] = m.bottomButtons(w)
 	if m.inChat {
 		rows[h-1] = hintRow(w, "Tab", "back to list")
 	} else {
-		rows[h-1] = hintRow(w, "⏎", "open", "c", "contacts", "p", "pin", "←→", "tabs", "u", "unread", "/", "find", "?", "help", "q", "quit")
+		rows[h-1] = hintRow(w, "⏎", "open", "c", "contacts", "f", "files", "p", "pin", "←→", "tabs", "u", "unread", "/", "find", "?", "help", "q", "quit")
 	}
 	return rows
 }
@@ -2995,7 +3036,7 @@ func (m *tuiModel) renderResults(rows []string, w, h int) []string {
 		}
 		rows[r], rows[r+1] = m.resItem(m.res[idx], idx == m.rsel, w)
 	}
-	rows[h-2] = bgr(w, seg{t: " "}, seg{t: " + Contacts ", fg: th.bg, bg: th.accent, bold: true})
+	rows[h-2] = m.bottomButtons(w)
 	rows[h-1] = hintRow(w, "⏎", "open", "Esc", "clear")
 	return rows
 }
@@ -3033,4 +3074,590 @@ func (m *tuiModel) resItem(r searchRes, selected bool, w int) (string, string) {
 		seg{t: trunc(sub, max(1, w-5-runewidth.StringWidth(prefix))), fg: th.dim},
 	)
 	return l1, l2
+}
+
+// ================================================================ file browser (📁)
+
+// fileItem is one row of the file browser: a file, a folder, or the ".." entry.
+type fileItem struct {
+	name, path string
+	dir, up    bool
+	size       int64
+	mod        time.Time
+}
+
+const (
+	filesBtnX = contactsBtnW + 2 // the 📁 button sits right after "+ Contacts"
+	filesBtnW = 4
+)
+
+// button rows (y) of the file-action screen and of the send-confirmation screen
+var fActY = [3]int{6, 9, 12}
+var fConfY = [2]int{7, 10}
+
+func btnHit(y, base int) bool { return y == base || y == base+1 }
+
+// bottomButtons is the row at the bottom of the chat list: "+ Contacts" and the 📁 button.
+func (m *tuiModel) bottomButtons(w int) string {
+	return bgr(w,
+		seg{t: " "},
+		seg{t: " + Contacts ", fg: th.bg, bg: th.accent, bold: true},
+		seg{t: " "},
+		seg{t: " 📁 ", fg: th.text, bg: th.sel, bold: true},
+	)
+}
+
+func humanSize(n int64) string {
+	const k = 1024.0
+	f := float64(n)
+	switch {
+	case f < k:
+		return fmt.Sprintf("%d B", n)
+	case f < k*k:
+		return fmt.Sprintf("%.0f KB", f/k)
+	case f < k*k*k:
+		return fmt.Sprintf("%.1f MB", f/(k*k))
+	}
+	return fmt.Sprintf("%.1f GB", f/(k*k*k))
+}
+
+func fileIcon(name string) string {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic":
+		return "📷"
+	case ".mp4", ".mkv", ".mov", ".3gp", ".webm":
+		return "🎬"
+	case ".mp3", ".m4a", ".ogg", ".opus", ".wav", ".aac":
+		return "🎵"
+	case ".apk", ".zip", ".rar", ".7z", ".tar", ".gz":
+		return "📦"
+	}
+	return "📄"
+}
+
+func shortPath(p string) string {
+	if h := homeDir(); h != "" && (p == h || strings.HasPrefix(p, h+"/")) {
+		return "~" + strings.TrimPrefix(p, h)
+	}
+	return p
+}
+
+// truncLeft keeps the END of s (the interesting part of a long path).
+func truncLeft(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if runewidth.StringWidth(s) <= w {
+		return s
+	}
+	r := []rune(s)
+	for len(r) > 0 && runewidth.StringWidth("…"+string(r)) > w {
+		r = r[1:]
+	}
+	return "…" + string(r)
+}
+
+// filesStartDir: the download folder (or the nearest parent that exists).
+func filesStartDir() string {
+	d := expandHome(loadConfig().DownloadDir)
+	for p := d; p != ""; {
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			return p
+		}
+		parent := filepath.Dir(p)
+		if parent == p {
+			break
+		}
+		p = parent
+	}
+	return homeDir()
+}
+
+// openWithDefault hands a file to the phone's default app (Termux: termux-open).
+func openWithDefault(path string) error {
+	for _, bin := range []string{"termux-open", "xdg-open", "open"} {
+		p, err := exec.LookPath(bin)
+		if err != nil {
+			continue
+		}
+		cmd := exec.Command(p, path)
+		if err := cmd.Start(); err != nil {
+			return err
+		}
+		go func() { _ = cmd.Wait() }()
+		return nil
+	}
+	return fmt.Errorf("no opener found — run: pkg install termux-tools")
+}
+
+func (m *tuiModel) openFiles() tea.Cmd {
+	m.showFiles = true
+	m.fStage = 0
+	m.ffilter.SetValue("")
+	m.ffilter.Blur()
+	m.loadFileDir(filesStartDir(), "")
+	return nil
+}
+
+func (m *tuiModel) closeFiles() {
+	m.showFiles = false
+	m.fStage = 0
+	m.ffilter.SetValue("")
+	m.ffilter.Blur()
+}
+
+// loadFileDir lists dir: folders first (A-Z), then files (newest first).
+func (m *tuiModel) loadFileDir(dir, focus string) {
+	m.fDir, m.fItems, m.fSel = dir, nil, 0
+	if parent := filepath.Dir(dir); parent != dir {
+		m.fItems = append(m.fItems, fileItem{name: "..", path: parent, dir: true, up: true})
+	}
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		m.status = "⚠ " + err.Error()
+		if os.IsPermission(err) {
+			m.status = "⚠ no permission — run: termux-setup-storage"
+		}
+		return
+	}
+	var dirs, files []fileItem
+	for _, e := range ents {
+		name := e.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		p := filepath.Join(dir, name)
+		st, err := os.Stat(p) // follows symlinks
+		if err != nil {
+			continue
+		}
+		it := fileItem{name: name, path: p, dir: st.IsDir(), size: st.Size(), mod: st.ModTime()}
+		if it.dir {
+			dirs = append(dirs, it)
+		} else {
+			files = append(files, it)
+		}
+	}
+	sort.Slice(dirs, func(i, j int) bool { return strings.ToLower(dirs[i].name) < strings.ToLower(dirs[j].name) })
+	sort.Slice(files, func(i, j int) bool { return files[i].mod.After(files[j].mod) })
+	m.fItems = append(m.fItems, dirs...)
+	m.fItems = append(m.fItems, files...)
+	if len(m.fItems) > 1 && m.fItems[0].up {
+		m.fSel = 1 // start on the first real entry, not on ".."
+	}
+	if focus != "" {
+		for i, it := range m.fItems {
+			if it.path == focus {
+				m.fSel = i
+			}
+		}
+	}
+}
+
+func (m *tuiModel) fileGeom(h int) (perPage, top int) {
+	perPage = max(1, (h-3)/2)
+	if len(m.fItems) > perPage {
+		top = clamp(m.fSel-perPage/2, 0, len(m.fItems)-perPage)
+	}
+	return
+}
+
+func (m *tuiModel) fileChatGeom(h int) (perPage, top int) {
+	perPage = max(1, (h-3)/2)
+	if len(m.fchats) > perPage {
+		top = clamp(m.fcSel-perPage/2, 0, len(m.fchats)-perPage)
+	}
+	return
+}
+
+func (m *tuiModel) moveFSel(d int) { m.fSel = clamp(m.fSel+d, 0, len(m.fItems)-1) }
+func (m *tuiModel) moveFC(d int)   { m.fcSel = clamp(m.fcSel+d, 0, len(m.fchats)-1) }
+
+func (m *tuiModel) fileUp() {
+	parent := filepath.Dir(m.fDir)
+	if parent == m.fDir {
+		return
+	}
+	m.loadFileDir(parent, m.fDir)
+}
+
+// activateFile: tap on a row. Folders open, files show the Open / Send screen.
+func (m *tuiModel) activateFile() {
+	if m.fSel < 0 || m.fSel >= len(m.fItems) {
+		return
+	}
+	it := m.fItems[m.fSel]
+	switch {
+	case it.up:
+		m.fileUp()
+	case it.dir:
+		m.loadFileDir(it.path, "")
+	default:
+		m.fFile = it
+		m.fStage = 1
+	}
+}
+
+func (m *tuiModel) doOpenFile() tea.Cmd {
+	f := m.fFile
+	m.fStage = 0
+	if err := openWithDefault(f.path); err != nil {
+		m.status = "⚠ " + err.Error()
+		return nil
+	}
+	m.status = "↗ opening " + f.name
+	return nil
+}
+
+// startPickChat: "Send" was pressed, show the chat list to choose where it goes.
+func (m *tuiModel) startPickChat() tea.Cmd {
+	m.fStage = 2
+	m.fcSel = 0
+	m.ffilter.SetValue("")
+	m.ffilter.Focus()
+	m.refilterFileChats()
+	return textinput.Blink
+}
+
+func (m *tuiModel) refilterFileChats() {
+	q := strings.TrimSpace(m.ffilter.Value())
+	var pin, rest []Chat
+	for _, c := range m.chats {
+		if k := chatKind(c.JID); k < 0 || k == 2 { // no status / channels: you can't send there
+			continue
+		}
+		if q != "" && fuzzyScore(q, c.Title()) == 0 {
+			continue
+		}
+		if m.pinned[c.JID] {
+			pin = append(pin, c)
+		} else {
+			rest = append(rest, c)
+		}
+	}
+	m.fchats = append(pin, rest...)
+	m.fcSel = clamp(m.fcSel, 0, len(m.fchats)-1)
+}
+
+// sendPicked sends the chosen file to the chosen chat and opens that chat.
+func (m *tuiModel) sendPicked() tea.Cmd {
+	c, f, be := m.fTarget, m.fFile, m.be
+	m.closeFiles()
+	open := m.openJIDByChat(c.JID)
+	m.status = "⏳ sending " + f.name + "…"
+	send := m.act(func() (string, error) {
+		if _, err := be.SendFile(FileArgs{Chat: c.JID, Path: f.path}); err != nil {
+			return "", err
+		}
+		return "✓ sent " + f.name, nil
+	})
+	return tea.Batch(open, send)
+}
+
+func (m *tuiModel) onFilesKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
+	switch m.fStage {
+	case 1: // Open / Send / Cancel
+		switch s {
+		case "o", "enter":
+			return m, m.doOpenFile()
+		case "s":
+			return m, m.startPickChat()
+		case "esc", "q", "c", "left", "h", "backspace":
+			m.fStage = 0
+		}
+		return m, nil
+	case 2: // choose a chat
+		switch s {
+		case "esc":
+			if m.ffilter.Value() != "" {
+				m.ffilter.SetValue("")
+				m.refilterFileChats()
+			} else {
+				m.ffilter.Blur()
+				m.fStage = 1
+			}
+			return m, nil
+		case "enter":
+			if m.fcSel >= 0 && m.fcSel < len(m.fchats) {
+				m.fTarget = m.fchats[m.fcSel]
+				m.ffilter.Blur()
+				m.fStage = 3
+			}
+			return m, nil
+		case "up":
+			m.moveFC(-1)
+			return m, nil
+		case "down":
+			m.moveFC(1)
+			return m, nil
+		case "pgup":
+			m.moveFC(-5)
+			return m, nil
+		case "pgdown":
+			m.moveFC(5)
+			return m, nil
+		}
+		before := m.ffilter.Value()
+		var cmd tea.Cmd
+		m.ffilter, cmd = m.ffilter.Update(k)
+		if m.ffilter.Value() != before {
+			m.fcSel = 0
+		}
+		m.refilterFileChats()
+		return m, cmd
+	case 3: // confirm
+		switch s {
+		case "enter", "y":
+			return m, m.sendPicked()
+		case "esc", "n", "q", "backspace":
+			m.fStage = 2
+			m.ffilter.Focus()
+			return m, textinput.Blink
+		}
+		return m, nil
+	}
+	page := max(1, (m.h-3)/2)
+	switch s { // file list
+	case "esc", "q":
+		m.closeFiles()
+	case "up", "k":
+		m.moveFSel(-1)
+	case "down", "j":
+		m.moveFSel(1)
+	case "pgup", "ctrl+u":
+		m.moveFSel(-page)
+	case "pgdown", "ctrl+d":
+		m.moveFSel(page)
+	case "g":
+		m.fSel = 0
+	case "G":
+		m.moveFSel(len(m.fItems))
+	case "left", "h", "backspace":
+		m.fileUp()
+	case "enter", "right", "l":
+		m.activateFile()
+	}
+	return m, nil
+}
+
+func (m *tuiModel) onFilesMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	h := m.h
+	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+		d := 2
+		if msg.Button == tea.MouseButtonWheelUp {
+			d = -2
+		}
+		switch m.fStage {
+		case 0:
+			m.moveFSel(d)
+		case 2:
+			m.moveFC(d)
+		}
+		return m, nil
+	}
+	if msg.Button != tea.MouseButtonLeft {
+		return m, nil
+	}
+	y := msg.Y
+	switch m.fStage {
+	case 0:
+		switch {
+		case y == 0:
+			m.closeFiles() // tap the "‹ Files" bar
+		case y >= 2 && y < h-1:
+			perPage, top := m.fileGeom(h)
+			slot := (y - 2) / 2
+			if slot < perPage && top+slot < len(m.fItems) {
+				m.fSel = top + slot
+				m.activateFile()
+			}
+		}
+	case 1:
+		switch {
+		case y == 0 || btnHit(y, fActY[2]):
+			m.fStage = 0
+		case btnHit(y, fActY[0]):
+			return m, m.doOpenFile()
+		case btnHit(y, fActY[1]):
+			return m, m.startPickChat()
+		}
+	case 2:
+		switch {
+		case y == 1:
+			m.ffilter.Blur()
+			m.fStage = 1
+		case y >= 2 && y < h-1:
+			perPage, top := m.fileChatGeom(h)
+			slot := (y - 2) / 2
+			if slot < perPage && top+slot < len(m.fchats) {
+				m.fcSel = top + slot
+				m.fTarget = m.fchats[m.fcSel]
+				m.ffilter.Blur()
+				m.fStage = 3
+			}
+		}
+	case 3:
+		switch {
+		case y == 0 || btnHit(y, fConfY[1]):
+			m.fStage = 2
+			m.ffilter.Focus()
+			return m, textinput.Blink
+		case btnHit(y, fConfY[0]):
+			return m, m.sendPicked()
+		}
+	}
+	return m, nil
+}
+
+// ---- drawing
+
+func (m *tuiModel) renderFiles() string {
+	w, h := m.w, m.h
+	rows := make([]string, h)
+	for i := range rows {
+		rows[i] = blankRow(w)
+	}
+	switch m.fStage {
+	case 1:
+		m.drawFileActions(rows, w, h)
+	case 2:
+		m.drawFilePick(rows, w, h)
+	case 3:
+		m.drawFileConfirm(rows, w, h)
+	default:
+		m.drawFileList(rows, w, h)
+	}
+	return strings.Join(rows, "\n")
+}
+
+func (m *tuiModel) fileRow(it fileItem, selected bool, w int) (string, string) {
+	bg := th.bg
+	if selected {
+		bg = th.sel
+	}
+	icon, sub := "📁", "folder"
+	switch {
+	case it.up:
+		icon, sub = "↑ ", "parent folder"
+	case !it.dir:
+		icon = fileIcon(it.name)
+		sub = humanSize(it.size) + " · " + fmtTime(it.mod.Unix())
+	}
+	l1 := render(bg, w,
+		seg{t: " "},
+		seg{t: icon},
+		seg{t: " "},
+		seg{t: trunc(clean(it.name), max(1, w-5)), fg: th.text, bold: it.dir},
+	)
+	l2 := render(bg, w,
+		seg{t: "    "},
+		seg{t: trunc(sub, max(1, w-5)), fg: th.dim},
+	)
+	return l1, l2
+}
+
+// statusOrHint: the bottom row, showing the latest message if there is one.
+func (m *tuiModel) statusOrHint(w int, pairs ...string) string {
+	if m.status != "" {
+		fg := th.accent
+		if strings.HasPrefix(m.status, "⚠") {
+			fg = warnColor
+		}
+		return bgr(w, seg{t: " " + trunc(m.status, max(1, w-2)), fg: fg})
+	}
+	return hintRow(w, pairs...)
+}
+
+func (m *tuiModel) drawFileList(rows []string, w, h int) {
+	rows[0] = render(th.bar, w, seg{t: " ‹ Files", fg: th.accent, bold: true})
+	rows[1] = bgr(w, seg{t: " " + truncLeft(shortPath(m.fDir), max(1, w-2)), fg: th.dim})
+	perPage, top := m.fileGeom(h)
+	for i := 0; i < perPage; i++ {
+		idx := top + i
+		if idx >= len(m.fItems) {
+			break
+		}
+		r := 2 + i*2
+		if r+1 >= h-1 {
+			break
+		}
+		rows[r], rows[r+1] = m.fileRow(m.fItems[idx], idx == m.fSel, w)
+	}
+	nReal := 0
+	for _, it := range m.fItems {
+		if !it.up {
+			nReal++
+		}
+	}
+	if nReal == 0 {
+		if r := 2 + len(m.fItems)*2; r < h-1 {
+			rows[r] = bgr(w, seg{t: " No files here", fg: th.dim})
+		}
+	}
+	rows[h-1] = m.statusOrHint(w, "⏎", "open", "←", "back", "Esc", "close")
+}
+
+func (m *tuiModel) drawButton(rows []string, y, w int, label string, primary bool) {
+	bg, fg := th.accent, th.bg
+	if !primary {
+		bg, fg = th.sel, th.text
+	}
+	inner := max(1, w-2)
+	t := runewidth.FillRight(trunc("  "+label, inner), inner)
+	if y >= 0 && y < len(rows) {
+		rows[y] = render(th.bg, w, seg{t: " "}, seg{t: t, fg: fg, bg: bg, bold: true})
+	}
+	if y+1 >= 0 && y+1 < len(rows) {
+		rows[y+1] = render(th.bg, w, seg{t: " "}, seg{t: spaces(inner), bg: bg})
+	}
+}
+
+func (m *tuiModel) drawFileInfo(rows []string, w int, f fileItem) {
+	rows[2] = bgr(w, seg{t: " " + fileIcon(f.name) + " "}, seg{t: trunc(clean(f.name), max(1, w-5)), fg: th.text, bold: true})
+	rows[3] = bgr(w, seg{t: "    " + trunc(humanSize(f.size)+" · "+fmtTime(f.mod.Unix()), max(1, w-5)), fg: th.dim})
+	rows[4] = bgr(w, seg{t: " " + truncLeft(shortPath(filepath.Dir(f.path)), max(1, w-2)), fg: th.dim})
+}
+
+func (m *tuiModel) drawFileActions(rows []string, w, h int) {
+	f := m.fFile
+	rows[0] = render(th.bar, w, seg{t: " ‹ File", fg: th.accent, bold: true})
+	m.drawFileInfo(rows, w, f)
+	m.drawButton(rows, fActY[0], w, "📂  Open", true)
+	m.drawButton(rows, fActY[1], w, "📤  Send to a chat", true)
+	m.drawButton(rows, fActY[2], w, "✕  Cancel", false)
+	rows[h-1] = hintRow(w, "o", "open", "s", "send", "Esc", "back")
+}
+
+func (m *tuiModel) drawFilePick(rows []string, w, h int) {
+	v := m.ffilter.View()
+	if pad := w - lipgloss.Width(v); pad > 0 {
+		v += blankRow(pad)
+	}
+	rows[0] = v
+	rows[1] = render(th.bar, w, seg{t: trunc(" ‹ Send "+clean(m.fFile.name)+" to…", w), fg: th.accent, bold: true})
+	if len(m.fchats) == 0 {
+		rows[2] = bgr(w, seg{t: " No chats found", fg: th.dim})
+	}
+	perPage, top := m.fileChatGeom(h)
+	for i := 0; i < perPage; i++ {
+		idx := top + i
+		if idx >= len(m.fchats) {
+			break
+		}
+		r := 2 + i*2
+		if r+1 >= h-1 {
+			break
+		}
+		rows[r], rows[r+1] = m.listItem(m.fchats[idx], idx == m.fcSel, w)
+	}
+	rows[h-1] = hintRow(w, "⏎", "pick", "Esc", "back")
+}
+
+func (m *tuiModel) drawFileConfirm(rows []string, w, h int) {
+	rows[0] = render(th.bar, w, seg{t: " ‹ Send this file?", fg: th.accent, bold: true})
+	m.drawFileInfo(rows, w, m.fFile)
+	rows[5] = bgr(w, seg{t: " → " + trunc(clean(m.fTarget.Title()), max(1, w-5)), fg: th.accent, bold: true})
+	m.drawButton(rows, fConfY[0], w, "✓  Send", true)
+	m.drawButton(rows, fConfY[1], w, "✕  Cancel", false)
+	rows[h-1] = hintRow(w, "⏎", "send", "Esc", "back")
 }
