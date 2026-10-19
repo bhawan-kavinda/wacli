@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"hash/fnv"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -13,22 +14,33 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/mattn/go-runewidth"
+	"github.com/muesli/termenv"
 )
 
 // ================================================================ themes
 
 type theme struct {
-	me, them, bar, accent, sel lipgloss.Color
+	bg, bar, me, them, accent, sel, pill, text, dim, tick lipgloss.Color
 }
 
 var themes = map[string]theme{
-	"whatsapp": {me: "23", them: "237", bar: "235", accent: "36", sel: "238"},
-	"ocean":    {me: "24", them: "237", bar: "17", accent: "39", sel: "238"},
-	"purple":   {me: "54", them: "237", bar: "53", accent: "141", sel: "238"},
-	"mono":     {me: "240", them: "236", bar: "234", accent: "252", sel: "238"},
+	// WhatsApp dark
+	"whatsapp": {bg: "#0B141A", bar: "#202C33", me: "#005C4B", them: "#202C33", accent: "#00A884",
+		sel: "#2A3942", pill: "#182229", text: "#E9EDEF", dim: "#8696A0", tick: "#53BDEB"},
+	// WhatsApp light
+	"light": {bg: "#EFEAE2", bar: "#F0F2F5", me: "#D9FDD3", them: "#FFFFFF", accent: "#00A884",
+		sel: "#D9DBDF", pill: "#FFFFFF", text: "#111B21", dim: "#667781", tick: "#53BDEB"},
+	"ocean": {bg: "#0B1620", bar: "#16283A", me: "#14507A", them: "#1B2B3A", accent: "#3BA3E0",
+		sel: "#223A52", pill: "#13222F", text: "#E6EEF5", dim: "#8AA0B2", tick: "#7CD0FF"},
+	"purple": {bg: "#130F1C", bar: "#241B35", me: "#5B2E91", them: "#2A2140", accent: "#A97BFF",
+		sel: "#332651", pill: "#1B1429", text: "#EEE9F7", dim: "#9A8FB0", tick: "#C3A6FF"},
+	"mono": {bg: "#111111", bar: "#1E1E1E", me: "#3A3A3A", them: "#242424", accent: "#D0D0D0",
+		sel: "#2E2E2E", pill: "#1A1A1A", text: "#EEEEEE", dim: "#8A8A8A", tick: "#FFFFFF"},
 }
 
 var th = themes["whatsapp"]
+
+const warnColor = lipgloss.Color("#FFB000")
 
 func themeNames() []string {
 	names := make([]string, 0, len(themes))
@@ -47,10 +59,8 @@ func applyTheme(name string) bool {
 	return ok
 }
 
-var senderColors = []lipgloss.Color{"39", "208", "170", "78", "215", "141", "203", "81", "149", "176"}
-var avatarBgs = []lipgloss.Color{"25", "90", "94", "28", "61", "130", "96", "31", "132", "65"}
-
-var stSep = lipgloss.NewStyle().Foreground(lipgloss.Color("238"))
+var senderColors = []lipgloss.Color{"#53BDEB", "#FFA97A", "#E26AB6", "#06CF9C", "#FFD279", "#A5B337", "#B292EB", "#FF7B6B", "#5ABB66", "#7FA4FF"}
+var avatarBgs = []lipgloss.Color{"#25786F", "#7E5B9A", "#9A6B3C", "#3C6E9A", "#8A4E5E", "#5B7F3A", "#8C7A2E", "#4E5BA3"}
 
 func hashIdx(s string, n int) int {
 	h := fnv.New32a()
@@ -105,6 +115,9 @@ func render(bg lipgloss.Color, width int, segs ...seg) string {
 	}
 	return b.String()
 }
+
+func bgr(w int, segs ...seg) string { return render(th.bg, w, segs...) }
+func blankRow(w int) string         { return render(th.bg, w) }
 
 func segsWidth(segs []seg) int {
 	n := 0
@@ -248,13 +261,28 @@ func prettyPreview(s string) string {
 	return s
 }
 
+// chatKind: 0 = personal chat, 1 = group, 2 = channel, -1 = hidden (status/broadcast).
+func chatKind(jid string) int {
+	switch {
+	case strings.HasSuffix(jid, "@g.us"):
+		return 1
+	case strings.HasSuffix(jid, "@newsletter"):
+		return 2
+	case strings.HasSuffix(jid, "@broadcast"):
+		return -1
+	}
+	return 0
+}
+
+func tabName(k int) string { return [...]string{"Chats", "Groups", "Channels"}[k] }
+
 // hintRow draws "key label" pairs, dropping the ones that don't fit.
 func hintRow(w int, pairs ...string) string {
 	segs := []seg{{t: " "}}
 	used := 1
 	for i := 0; i+1 < len(pairs); i += 2 {
-		k := seg{t: " " + pairs[i] + " ", fg: "252", bg: "238", bold: true}
-		l := seg{t: " " + pairs[i+1] + "  ", fg: "245"}
+		k := seg{t: " " + pairs[i] + " ", fg: th.text, bg: th.sel, bold: true}
+		l := seg{t: " " + pairs[i+1] + "  ", fg: th.dim}
 		need := segsWidth([]seg{k, l})
 		if used+need > w {
 			break
@@ -262,7 +290,7 @@ func hintRow(w int, pairs ...string) string {
 		segs = append(segs, k, l)
 		used += need
 	}
-	return render("", w, segs...)
+	return bgr(w, segs...)
 }
 
 // ================================================================ model
@@ -290,6 +318,7 @@ type tuiModel struct {
 
 	chats     []Chat
 	shown     []Chat
+	tab       int
 	sel       int
 	selJID    string
 	filter    textinput.Model
@@ -320,19 +349,31 @@ type tuiModel struct {
 	cancel func()
 }
 
+func (m *tuiModel) restyle() {
+	st := lipgloss.NewStyle().Background(th.bg)
+	m.input.PromptStyle = st.Foreground(th.accent).Bold(true)
+	m.input.TextStyle = st.Foreground(th.text)
+	m.input.PlaceholderStyle = st.Foreground(th.dim)
+	m.filter.PromptStyle = m.input.PromptStyle
+	m.filter.TextStyle = m.input.TextStyle
+	m.filter.PlaceholderStyle = m.input.PlaceholderStyle
+}
+
 func runTUI(b Backend) error {
+	if os.Getenv("WACLI_256") == "" {
+		lipgloss.SetColorProfile(termenv.TrueColor) // Termux supports 24-bit colour
+	}
 	applyTheme(loadConfig().Theme)
 	ti := textinput.New()
 	ti.Prompt = "❯ "
 	ti.Placeholder = "Type a message…  (/help)"
 	ti.CharLimit = 4000
-	ti.PromptStyle = lipgloss.NewStyle().Foreground(th.accent).Bold(true)
 	fi := textinput.New()
-	fi.Prompt = "/ "
-	fi.Placeholder = "search chats"
-	fi.PromptStyle = lipgloss.NewStyle().Foreground(th.accent).Bold(true)
+	fi.Prompt = "🔍 "
+	fi.Placeholder = "search"
 
 	m := &tuiModel{be: b, input: ti, filter: fi, selMsg: -1}
+	m.restyle()
 	if ch, cancel, err := b.Subscribe(); err == nil {
 		m.events, m.cancel = ch, cancel
 	} else {
@@ -462,7 +503,7 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.w, m.h = msg.Width, msg.Height
 		m.input.Width = max(8, m.paneWidths()[1]-4)
-		m.filter.Width = max(8, m.paneWidths()[0]-4)
+		m.filter.Width = max(8, m.paneWidths()[0]-6)
 	case chatsMsg:
 		m.chats = []Chat(msg)
 		m.refilter()
@@ -527,19 +568,69 @@ func (m *tuiModel) onEvent(ev Event) (tea.Model, tea.Cmd) {
 	return m, tea.Batch(cmds...)
 }
 
+// ---- tabs (Chats / Groups / Channels)
+
+func (m *tuiModel) tabList() []int {
+	list := []int{0, 1}
+	for _, c := range m.chats {
+		if chatKind(c.JID) == 2 {
+			list = append(list, 2)
+			break
+		}
+	}
+	return list
+}
+
+func (m *tuiModel) tabUnread(kind int) int {
+	n := 0
+	for _, c := range m.chats {
+		if chatKind(c.JID) == kind {
+			n += c.Unread
+		}
+	}
+	return n
+}
+
+func (m *tuiModel) setTab(k int) {
+	ok := false
+	for _, t := range m.tabList() {
+		if t == k {
+			ok = true
+		}
+	}
+	if !ok || k == m.tab {
+		return
+	}
+	m.tab = k
+	m.sel = 0
+	m.selJID = ""
+	m.refilter()
+}
+
+func (m *tuiModel) switchTab(d int) {
+	list := m.tabList()
+	idx := 0
+	for i, k := range list {
+		if k == m.tab {
+			idx = i
+		}
+	}
+	m.setTab(list[clamp(idx+d, 0, len(list)-1)])
+}
+
 func (m *tuiModel) refilter() {
 	q := strings.TrimSpace(m.filter.Value())
-	if !m.filtering || q == "" {
-		m.shown = m.chats
-	} else {
-		var out []Chat
-		for _, c := range m.chats {
-			if fuzzyScore(q, c.Title()) > 0 {
-				out = append(out, c)
-			}
+	var out []Chat
+	for _, c := range m.chats {
+		if chatKind(c.JID) != m.tab {
+			continue
 		}
-		m.shown = out
+		if m.filtering && q != "" && fuzzyScore(q, c.Title()) == 0 {
+			continue
+		}
+		out = append(out, c)
 	}
+	m.shown = out
 	m.fixSel()
 }
 
@@ -726,7 +817,17 @@ func (m *tuiModel) onListKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		m.moveSel(-len(m.shown))
 	case "G":
 		m.moveSel(len(m.shown))
-	case "enter", "right", "l":
+	case "left", "h":
+		m.switchTab(-1)
+	case "right", "l":
+		m.switchTab(1)
+	case "1":
+		m.setTab(0)
+	case "2":
+		m.setTab(1)
+	case "3":
+		m.setTab(2)
+	case "enter":
 		return m, m.openSel()
 	case "tab":
 		if m.cur != "" {
@@ -927,8 +1028,7 @@ func (m *tuiModel) slash(text string) tea.Cmd {
 		c := loadConfig()
 		c.Theme = name
 		_ = c.Save()
-		m.input.PromptStyle = lipgloss.NewStyle().Foreground(th.accent).Bold(true)
-		m.filter.PromptStyle = m.input.PromptStyle
+		m.restyle()
 		m.status = "theme: " + name
 	case "/file":
 		parts := strings.Fields(rest)
@@ -995,7 +1095,7 @@ func (m *tuiModel) paneWidths() [2]int {
 		}
 		return [2]int{m.w, 0}
 	}
-	l := clamp(m.w/3, 24, 36)
+	l := clamp(m.w/3, 26, 38)
 	return [2]int{l, m.w - l - 1}
 }
 
@@ -1019,7 +1119,7 @@ func (m *tuiModel) View() string {
 		right = m.renderChat(rw, m.h)
 	}
 	rows := make([]string, m.h)
-	sep := stSep.Render("│")
+	sep := render(th.bg, 1, seg{t: "│", fg: th.sel})
 	for i := range rows {
 		switch {
 		case lw > 0 && rw > 0:
@@ -1037,22 +1137,23 @@ func (m *tuiModel) renderHelp() string {
 	w := m.w
 	var rows []string
 	title := func(t string) {
-		rows = append(rows, render("", w, seg{t: " " + t, fg: th.accent, bold: true}))
+		rows = append(rows, bgr(w, seg{t: " " + t, fg: th.accent, bold: true}))
 	}
 	line := func(k, d string) {
 		budget := max(0, w-3-12-1)
-		rows = append(rows, render("", w,
-			seg{t: "   " + runewidth.FillRight(k, 12), fg: "252", bold: true},
-			seg{t: trunc(d, budget), fg: "245"}))
+		rows = append(rows, bgr(w,
+			seg{t: "   " + runewidth.FillRight(k, 12), fg: th.text, bold: true},
+			seg{t: trunc(d, budget), fg: th.dim}))
 	}
-	blank := func() { rows = append(rows, strings.Repeat(" ", w)) }
+	blank := func() { rows = append(rows, blankRow(w)) }
 
-	rows = append(rows, render(th.bar, w, seg{t: " wacli — help", fg: "255", bold: true}))
+	rows = append(rows, render(th.bar, w, seg{t: " wacli — help", fg: th.text, bold: true}))
 	blank()
 	title("Chat list")
-	line("⏎ / l", "open chat")
+	line("⏎", "open chat")
+	line("← → 1 2", "Chats / Groups tabs")
 	line("j k  ↑ ↓", "move")
-	line("/", "search chats")
+	line("/", "search this tab")
 	line("q", "quit")
 	blank()
 	title("In a chat")
@@ -1072,43 +1173,72 @@ func (m *tuiModel) renderHelp() string {
 	line("/file path", "send a file [caption]")
 	line("/theme name", strings.Join(themeNames(), " "))
 	blank()
-	rows = append(rows, render("", w, seg{t: " ✓ sent  ✓✓ delivered  ", fg: "245"}, seg{t: "✓✓", fg: "39"}, seg{t: " read", fg: "245"}))
+	rows = append(rows, bgr(w,
+		seg{t: " ✓ sent  ✓✓ delivered  ", fg: th.dim},
+		seg{t: "✓✓", fg: th.tick},
+		seg{t: " read", fg: th.dim}))
 	blank()
-	rows = append(rows, render("", w, seg{t: " press any key to close", fg: "245", ital: true}))
+	rows = append(rows, bgr(w, seg{t: " press any key to close", fg: th.dim, ital: true}))
+	for len(rows) < m.h {
+		rows = append(rows, blankRow(w))
+	}
 	if len(rows) > m.h {
 		rows = rows[:m.h]
 	}
 	return strings.Join(rows, "\n")
 }
 
+func (m *tuiModel) tabBar(w int) string {
+	segs := []seg{{t: " "}}
+	used := 1
+	for _, k := range m.tabList() {
+		label := " " + tabName(k)
+		if n := m.tabUnread(k); n > 0 {
+			label += fmt.Sprintf(" %d", n)
+		}
+		label += " "
+		lw := runewidth.StringWidth(label)
+		if used+lw+1 > w {
+			break
+		}
+		if k == m.tab {
+			segs = append(segs, seg{t: label, fg: th.bg, bg: th.accent, bold: true})
+		} else {
+			segs = append(segs, seg{t: label, fg: th.dim})
+		}
+		segs = append(segs, seg{t: " "})
+		used += lw + 1
+	}
+	return bgr(w, segs...)
+}
+
 func (m *tuiModel) renderList(w, h int) []string {
 	rows := make([]string, h)
-	blank := strings.Repeat(" ", w)
 	for i := range rows {
-		rows[i] = blank
+		rows[i] = blankRow(w)
 	}
-	dotFg := lipgloss.Color("203")
+	dotFg := lipgloss.Color("#F15C6D")
 	if m.online {
-		dotFg = "78"
+		dotFg = th.accent
 	}
 	if m.filtering {
 		v := m.filter.View()
 		if pad := w - lipgloss.Width(v); pad > 0 {
-			v += strings.Repeat(" ", pad)
+			v += blankRow(pad)
 		}
 		rows[0] = v
 	} else {
 		rows[0] = render(th.bar, w,
 			seg{t: " ●", fg: dotFg},
-			seg{t: " Chats", fg: "255", bold: true},
-			seg{t: fmt.Sprintf("  %d", len(m.shown)), fg: "245"})
+			seg{t: " wacli", fg: th.text, bold: true})
 	}
+	rows[1] = m.tabBar(w)
 
 	if len(m.shown) == 0 {
-		rows[1] = render("", w, seg{t: trunc(" No chats yet", w), fg: "245"})
-		rows[2] = render("", w, seg{t: trunc(" New messages show up here", w), fg: "245"})
+		rows[2] = bgr(w, seg{t: trunc(" Nothing here yet", w), fg: th.dim})
+		rows[3] = bgr(w, seg{t: trunc(" New messages show up here", w), fg: th.dim})
 	}
-	perPage := max(1, (h-2)/2)
+	perPage := max(1, (h-3)/2)
 	top := 0
 	if len(m.shown) > perPage {
 		top = clamp(m.sel-perPage/2, 0, len(m.shown)-perPage)
@@ -1118,7 +1248,7 @@ func (m *tuiModel) renderList(w, h int) []string {
 		if idx >= len(m.shown) {
 			break
 		}
-		r := 1 + i*2
+		r := 2 + i*2
 		if r+1 >= h-1 {
 			break
 		}
@@ -1127,13 +1257,13 @@ func (m *tuiModel) renderList(w, h int) []string {
 	if m.inChat {
 		rows[h-1] = hintRow(w, "Tab", "back to list")
 	} else {
-		rows[h-1] = hintRow(w, "⏎", "open", "/", "search", "?", "help", "q", "quit")
+		rows[h-1] = hintRow(w, "⏎", "open", "←→", "tabs", "/", "find", "?", "help", "q", "quit")
 	}
 	return rows
 }
 
 func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
-	bg := lipgloss.Color("")
+	bg := th.bg
 	if selected {
 		bg = th.sel
 	}
@@ -1141,17 +1271,15 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 	av := runewidth.FillRight(runewidth.Truncate(initials(name), 2, ""), 2)
 	tm := listTime(c.LastTS)
 	tmW := runewidth.StringWidth(tm)
-	nameFg := lipgloss.Color("252")
-	tmFg := lipgloss.Color("245")
+	nameFg, tmFg := th.text, th.dim
 	if c.Unread > 0 {
-		nameFg = "255"
 		tmFg = th.accent
 	}
 	nm := trunc(name, max(1, w-5-tmW-1))
 	gap := max(1, w-4-runewidth.StringWidth(nm)-tmW-1)
 	l1 := render(bg, w,
 		seg{t: " "},
-		seg{t: av, fg: "255", bg: avatarBgs[hashIdx(c.JID, len(avatarBgs))], bold: true},
+		seg{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(c.JID, len(avatarBgs))], bold: true},
 		seg{t: " "},
 		seg{t: nm, fg: nameFg, bold: c.Unread > 0},
 		seg{t: spaces(gap)},
@@ -1169,9 +1297,9 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 	gap2 := max(0, w-4-runewidth.StringWidth(pv)-bw-1)
 	l2 := render(bg, w,
 		seg{t: "    "},
-		seg{t: pv, fg: "245"},
+		seg{t: pv, fg: th.dim},
 		seg{t: spaces(gap2)},
-		seg{t: badge, fg: "16", bg: th.accent, bold: true},
+		seg{t: badge, fg: th.bg, bg: th.accent, bold: true},
 	)
 	return l1, l2
 }
@@ -1185,14 +1313,14 @@ func presSeg(p PresenceInfo, typing bool) seg {
 	case p.Online:
 		return seg{t: "● online", fg: th.accent}
 	case p.LastSeen > 0:
-		return seg{t: "last seen " + fmtTime(p.LastSeen), fg: "245"}
+		return seg{t: "last seen " + fmtTime(p.LastSeen), fg: th.dim}
 	}
-	return seg{t: "offline", fg: "245"}
+	return seg{t: "offline", fg: th.dim}
 }
 
 func (m *tuiModel) chatHeader(w int) string {
 	if m.cur == "" {
-		return render(th.bar, w, seg{t: " wacli", fg: "255", bold: true})
+		return render(th.bar, w, seg{t: " wacli", fg: th.text, bold: true})
 	}
 	lead := " "
 	if m.w < 70 {
@@ -1207,9 +1335,9 @@ func (m *tuiModel) chatHeader(w int) string {
 	av := runewidth.FillRight(runewidth.Truncate(initials(m.curName), 2, ""), 2)
 	left := []seg{
 		{t: lead, fg: th.accent, bold: true},
-		{t: av, fg: "255", bg: avatarBgs[hashIdx(m.cur, len(avatarBgs))], bold: true},
+		{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(m.cur, len(avatarBgs))], bold: true},
 		{t: " "},
-		{t: name, fg: "255", bold: true},
+		{t: name, fg: th.text, bold: true},
 	}
 	gap := max(1, w-segsWidth(left)-rw)
 	segs := append(left, seg{t: spaces(gap)})
@@ -1221,11 +1349,11 @@ func (m *tuiModel) chatHeader(w int) string {
 
 func (m *tuiModel) contextRow(w int) string {
 	one := func(fg lipgloss.Color, text string) string {
-		return render("", w, seg{t: " " + trunc(clean(text), w-2), fg: fg})
+		return bgr(w, seg{t: " " + trunc(clean(text), w-2), fg: fg})
 	}
 	switch {
 	case m.confirmDel:
-		return one("214", "Delete for everyone?  y = yes · any other key = cancel")
+		return one(warnColor, "Delete for everyone?  y = yes · any other key = cancel")
 	case m.picker:
 		return one(th.accent, "React:  1👍 2❤️ 3😂 4😮 5😢 6🙏   Esc cancel")
 	case m.hasReply:
@@ -1236,16 +1364,16 @@ func (m *tuiModel) contextRow(w int) string {
 			who = userPart(m.reply.Sender)
 		}
 		txt := strings.ReplaceAll(prettyPreview(previewOf(&m.reply)), "\n", " ")
-		return render("", w,
+		return bgr(w,
 			seg{t: " ↪ ", fg: th.accent, bold: true},
-			seg{t: trunc(clean(who+": "+txt), max(1, w-6)), fg: "245"},
-			seg{t: "  ✕", fg: "245"})
+			seg{t: trunc(clean(who+": "+txt), max(1, w-6)), fg: th.dim},
+			seg{t: "  ✕", fg: th.dim})
 	case m.editID != "":
 		return one(th.accent, "✎ Editing — Enter saves · Esc cancels")
 	case m.status != "":
-		fg := lipgloss.Color("245")
+		fg := th.dim
 		if strings.HasPrefix(m.status, "⚠") {
-			fg = "214"
+			fg = warnColor
 		}
 		return one(fg, m.status)
 	case m.selMsg >= 0:
@@ -1258,13 +1386,16 @@ func (m *tuiModel) contextRow(w int) string {
 
 func (m *tuiModel) renderChat(w, h int) []string {
 	rows := make([]string, h)
+	for i := range rows {
+		rows[i] = blankRow(w)
+	}
 	rows[0] = m.chatHeader(w)
 	avail := h - 3
 
 	if m.cur == "" {
-		rows[1] = render("", w, seg{t: trunc(" Pick a chat from the list", w), fg: "245"})
+		rows[1] = bgr(w, seg{t: trunc(" Pick a chat from the list", w), fg: th.dim})
 	} else if len(m.msgs) == 0 {
-		rows[avail/2+1] = render("", w, seg{t: trunc("   No messages yet — say hi 👋", w), fg: "245"})
+		rows[avail/2+1] = bgr(w, seg{t: trunc("   No messages yet — say hi 👋", w), fg: th.dim})
 	} else {
 		lay := m.layoutMsgs(w)
 		lines := lay.lines
@@ -1291,7 +1422,11 @@ func (m *tuiModel) renderChat(w, h int) []string {
 	}
 	rows[h-2] = m.contextRow(w)
 	if m.cur != "" {
-		rows[h-1] = m.input.View()
+		v := m.input.View()
+		if pad := w - lipgloss.Width(v); pad > 0 {
+			v += blankRow(pad)
+		}
+		rows[h-1] = v
 	}
 	return rows
 }
@@ -1312,17 +1447,17 @@ func (m *tuiModel) layoutMsgs(w int) msgLayout {
 	var prevTS int64
 	for i, mm := range m.msgs {
 		day := dayLabel(mm.TS)
-		if day != prevDay {
+		newDay := day != prevDay
+		if newDay {
 			if len(lay.lines) > 0 {
-				lay.lines = append(lay.lines, "")
+				lay.lines = append(lay.lines, blankRow(w))
 			}
 			lay.lines = append(lay.lines, centerPill(day, w))
 			prevDay = day
-		} else if mm.Sender != prevSender || mm.TS-prevTS > 300 {
-			lay.lines = append(lay.lines, "")
 		}
+		tail := newDay || mm.Sender != prevSender || mm.TS-prevTS > 300
 		lay.start[i] = len(lay.lines)
-		lay.lines = append(lay.lines, m.bubble(mm, w, group, i == m.selMsg, byID)...)
+		lay.lines = append(lay.lines, m.bubble(mm, w, group, i == m.selMsg, tail, byID)...)
 		lay.end[i] = len(lay.lines)
 		prevSender, prevTS = mm.Sender, mm.TS
 	}
@@ -1331,15 +1466,18 @@ func (m *tuiModel) layoutMsgs(w int) msgLayout {
 
 func centerPill(text string, w int) string {
 	t := " " + text + " "
-	tw := runewidth.StringWidth(t)
-	return spaces((w-tw)/2) + render("238", tw, seg{t: t, fg: "250"})
+	return bgr(w,
+		seg{t: spaces((w - runewidth.StringWidth(t)) / 2)},
+		seg{t: t, fg: th.dim, bg: th.pill})
 }
 
-func (m *tuiModel) bubble(mm Message, w int, group, selected bool, byID map[string]Message) []string {
-	maxInner := clamp(w*72/100-2, 14, max(14, w-6))
-	bg, fg := th.them, lipgloss.Color("252")
+// bubble draws one WhatsApp-style message: rounded corners (quadrant/half blocks),
+// own messages on the right, a sharp "tail" corner on the first message of a run.
+func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID map[string]Message) []string {
+	maxInner := clamp(w*75/100-2, 14, max(14, w-6))
+	bb := th.them
 	if mm.FromMe {
-		bg, fg = th.me, "255"
+		bb = th.me
 	}
 	var rows [][]seg
 
@@ -1360,15 +1498,15 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected bool, byID map[stri
 		}
 		rows = append(rows, []seg{
 			{t: "▎", fg: th.accent},
-			{t: trunc(" "+clean(q), maxInner-1), fg: "246", ital: true},
+			{t: trunc(" "+clean(q), maxInner-1), fg: th.dim, ital: true},
 		})
 	}
 
 	body := clean(mm.Text)
-	bodyFg := fg
+	bodyFg := th.text
 	switch {
 	case mm.Deleted:
-		body, bodyFg = "🚫 This message was deleted", "245"
+		body, bodyFg = "🚫 This message was deleted", th.dim
 	case kindLabel(mm) != "":
 		if body != "" {
 			body = kindLabel(mm) + "\n" + body
@@ -1385,40 +1523,98 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected bool, byID map[stri
 		rows = append(rows, []seg{{t: trunc(mm.Reactions, maxInner)}})
 	}
 
+	// footer: [edited] 12:30 ✓✓  — placed on the last text row when it fits
 	var foot []seg
 	if mm.Edited && !mm.Deleted {
-		foot = append(foot, seg{t: "edited ", fg: "246", ital: true})
+		foot = append(foot, seg{t: "edited ", fg: th.dim, ital: true})
 	}
-	foot = append(foot, seg{t: time.Unix(mm.TS, 0).Format("15:04"), fg: "246"})
+	foot = append(foot, seg{t: time.Unix(mm.TS, 0).Format("15:04"), fg: th.dim})
 	if mm.FromMe {
-		tick, tc := "✓", lipgloss.Color("246")
+		tick, tc := "✓", th.dim
 		switch {
 		case mm.Status >= 2:
-			tick, tc = "✓✓", "39"
+			tick, tc = "✓✓", th.tick
 		case mm.Status == 1:
 			tick = "✓✓"
 		}
 		foot = append(foot, seg{t: " " + tick, fg: tc})
 	}
+	fw := segsWidth(foot)
 
-	inner := segsWidth(foot)
+	inner := 0
 	for _, r := range rows {
 		inner = max(inner, segsWidth(r))
 	}
+	merge := false
+	if n := len(rows); n > 0 {
+		if lw := segsWidth(rows[n-1]); lw+2+fw <= maxInner {
+			merge = true
+			inner = max(inner, lw+2+fw)
+		}
+	}
+	if !merge {
+		inner = max(inner, fw)
+	}
 	inner = clamp(inner, 4, maxInner)
-	rows = append(rows, append([]seg{{t: spaces(inner - segsWidth(foot))}}, foot...))
+	if merge {
+		n := len(rows)
+		last := append([]seg{}, rows[n-1]...)
+		last = append(last, seg{t: spaces(inner - segsWidth(rows[n-1]) - fw)})
+		rows[n-1] = append(last, foot...)
+	} else {
+		rows = append(rows, append([]seg{{t: spaces(inner - fw)}}, foot...))
+	}
 
 	total := inner + 2
-	margin := " "
-	if mm.FromMe {
-		margin = spaces(max(1, w-total-1))
+	tl, tr := "▗", "▖"
+	if tail {
+		if mm.FromMe {
+			tr = "▄"
+		} else {
+			tl = "▄"
+		}
 	}
-	if selected {
-		margin = lipgloss.NewStyle().Foreground(th.accent).Bold(true).Render("▌") + margin[1:]
+	edge := func(l, mid, r string) []seg {
+		return []seg{
+			{t: l, fg: bb, bg: th.bg},
+			{t: strings.Repeat(mid, total-2), fg: bb, bg: th.bg},
+			{t: r, fg: bb, bg: th.bg},
+		}
 	}
-	out := make([]string, 0, len(rows))
+	cores := [][]seg{edge(tl, "▄", tr)}
 	for _, r := range rows {
-		out = append(out, margin+render(bg, total, append([]seg{{t: " "}}, r...)...))
+		line := []seg{{t: " ", bg: bb}}
+		for _, s := range r {
+			if s.bg == "" {
+				s.bg = bb
+			}
+			if s.fg == "" {
+				s.fg = th.text
+			}
+			line = append(line, s)
+		}
+		if rw := segsWidth(r); rw < inner {
+			line = append(line, seg{t: spaces(inner - rw), bg: bb})
+		}
+		line = append(line, seg{t: " ", bg: bb})
+		cores = append(cores, line)
+	}
+	cores = append(cores, edge("▝", "▀", "▘"))
+
+	lead := " "
+	if mm.FromMe {
+		lead = spaces(max(1, w-total-1))
+	}
+	out := make([]string, 0, len(cores))
+	for _, core := range cores {
+		var segs []seg
+		if selected {
+			segs = append(segs, seg{t: "▌", fg: th.accent}, seg{t: lead[1:]})
+		} else {
+			segs = append(segs, seg{t: lead})
+		}
+		segs = append(segs, core...)
+		out = append(out, render(th.bg, w, segs...))
 	}
 	return out
 }
