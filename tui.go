@@ -429,9 +429,10 @@ func (m *tuiModel) restyle() {
 	m.input.PromptStyle = st.Foreground(th.accent).Bold(true)
 	m.input.TextStyle = st.Foreground(th.text)
 	m.input.PlaceholderStyle = st.Foreground(th.dim)
-	m.filter.PromptStyle = m.input.PromptStyle
-	m.filter.TextStyle = m.input.TextStyle
-	m.filter.PlaceholderStyle = m.input.PlaceholderStyle
+	pill := lipgloss.NewStyle().Background(th.bar) // the search pill sits on the bar colour
+	m.filter.PromptStyle = pill.Foreground(th.accent).Bold(true)
+	m.filter.TextStyle = pill.Foreground(th.text)
+	m.filter.PlaceholderStyle = pill.Foreground(th.dim)
 	m.cfilter.PromptStyle = m.input.PromptStyle
 	m.cfilter.TextStyle = m.input.TextStyle
 	m.cfilter.PlaceholderStyle = m.input.PlaceholderStyle
@@ -1545,9 +1546,9 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 			return m, m.openContacts()
 		case fabHit(x, y, w, h-1) == fabFiles:
 			return m, m.openFiles()
-		case y >= 2 && y < h-1:
+		case y >= topRows && y < h-1:
 			perPage, top := m.resGeom(h)
-			slot := (y - 2) / 2
+			slot := (y - topRows) / 2
 			if slot < perPage && top+slot < len(m.res) {
 				m.rsel = top + slot
 				return m, m.openRes()
@@ -1561,16 +1562,29 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 	case fabHit(x, y, w, h-navRows) == fabFiles:
 		return m, m.openFiles()
 	case y == 0 && !m.filtering:
-		m.showDash = true // tap the "WhatsApp" bar for the home dashboard
+		m.showDash = true // tap the "WhatsApp" title for the home dashboard
+	case y >= 1 && y <= 3 && !m.filtering: // tap the search pill (3 rows tall)
+		m.filtering = true
+		m.filter.Focus()
+		if !m.contactsOK {
+			return m, tea.Batch(textinput.Blink, m.loadContacts())
+		}
+		return m, textinput.Blink
+	case y == 4: // filter chips
+		for _, p := range m.chipLayout(w) {
+			if x >= p.x0 && x < p.x1 {
+				m.setTab(p.kind)
+			}
+		}
 	case y >= h-navRows: // bottom tab bar
 		for _, p := range m.navCells(w) {
 			if x >= p.x0 && x < p.x1 {
 				m.setTab(p.kind)
 			}
 		}
-	case y >= 1 && y < h-navRows:
+	case y >= topRows && y < h-navRows:
 		perPage, top := m.listGeom(h)
-		slot := (y - 1) / 2
+		slot := (y - topRows) / itemRows
 		if slot < perPage && top+slot < len(m.shown) {
 			m.sel = top + slot
 			m.selJID = m.shown[m.sel].JID
@@ -1956,6 +1970,107 @@ func (m *tuiModel) tabBar(w int) string {
 }
 
 const navRows = 2 // height of the bottom tab bar: icon row + label row
+// Top area, WhatsApp style (6 rows): 0 title, 1-3 rounded search pill, 4 filter chips, 5 spacer.
+const topRows = 6
+const itemRows = 4 // one chat card in the list: name row, preview row, breathing row (avatar spans all 3)
+
+// chipName: the filter-chip label for a tab (WhatsApp calls the first one "All").
+func chipName(k int) string { return [...]string{"All", "Groups", "Channels", "Unread"}[k] }
+
+// chipLayout places the filter chips on row 4; the same positions are used for taps.
+// A chip is a solid block: one padding cell + label + one padding cell.
+func (m *tuiModel) chipLayout(w int) []tabPos {
+	var out []tabPos
+	x := 1
+	for _, k := range m.tabList() {
+		label := " " + chipName(k)
+		if k == 3 {
+			if n := m.tabUnread(k); n > 0 {
+				label += " " + unreadLabel(n)
+			}
+		}
+		label += " "
+		cw := runewidth.StringWidth(label) + 2
+		if x+cw > w {
+			break
+		}
+		out = append(out, tabPos{kind: k, x0: x, x1: x + cw, label: label})
+		x += cw + 1
+	}
+	return out
+}
+
+// glyphRow paints raw block glyphs (fg colour on the page background) - used for the
+// rounded edges of the search pill.
+func glyphRow(w int, fg lipgloss.Color, s string) string {
+	return blankRow(1) + segStyle(seg{fg: fg}, th.bg).Render(s) + blankRow(w-1-runewidth.StringWidth(s))
+}
+
+// topBar draws the WhatsApp-style header of the chat list (see topRows):
+//
+//	row 0     WhatsApp                          ●  ⋮
+//	rows 1-3  ╭ 🔍  Search chats, contacts… ╮   (rounded pill, a tap starts the search)
+//	row 4     ( All ) ( Groups ) ( Unread 3 )   (filter chips, active one is green)
+//	row 5     spacer
+func (m *tuiModel) topBar(w int) []string {
+	rows := make([]string, topRows)
+
+	// row 0: bold title + connection dot + menu
+	dotFg := lipgloss.Color("#F15C6D")
+	if m.online {
+		dotFg = th.accent
+	}
+	rows[0] = render(th.bg, w,
+		seg{t: " WhatsApp", fg: th.text, bold: true},
+		seg{t: spaces(max(1, w-9-5))},
+		seg{t: "●", fg: dotFg},
+		seg{t: "  "},
+		seg{t: "⋮ ", fg: th.text, bold: true})
+
+	// rows 1-3: search pill. Half blocks + quadrant corners make the top and bottom edges
+	// look rounded; the middle row is the real text box while searching.
+	if iw := w - 2; iw < 6 {
+		rows[1], rows[2], rows[3] = blankRow(w), blankRow(w), blankRow(w)
+	} else {
+		rows[1] = blankRow(1) + render(th.bar, iw) + blankRow(1) // solid pill, no half-block glyphs
+		var mid string
+		if m.filtering {
+			v := m.filter.View()
+			mid = blankRow(1) + v
+			if pad := iw - lipgloss.Width(v); pad > 0 {
+				mid += render(th.bar, pad)
+			}
+			mid += blankRow(1)
+		} else {
+			mid = blankRow(1) +
+				render(th.bar, iw, seg{t: trunc("  🔍  Search chats, contacts, messages", iw), fg: th.dim}) +
+				blankRow(1)
+		}
+		rows[2] = mid
+		rows[3] = blankRow(1) + render(th.bar, iw) + blankRow(1)
+	}
+
+	// row 4: filter chips with rounded caps
+	var segs []seg
+	cur := 0
+	for _, p := range m.chipLayout(w) {
+		if p.x0 > cur {
+			segs = append(segs, seg{t: spaces(p.x0 - cur)})
+		}
+		chipBg, fg, bold := th.pill, th.dim, false
+		if p.kind == m.tab {
+			chipBg, fg, bold = th.me, th.accent, true
+		}
+		segs = append(segs,
+			seg{t: " ", bg: chipBg},
+			seg{t: p.label, fg: fg, bg: chipBg, bold: bold},
+			seg{t: " ", bg: chipBg})
+		cur = p.x1
+	}
+	rows[4] = bgr(w, segs...)
+	rows[5] = blankRow(w)
+	return rows
+}
 
 func tabIcon(k int) string { return [...]string{"💬", "👥", "📢", "🔔"}[k] }
 
@@ -2099,7 +2214,7 @@ func overlayFabs(rows []string, w, bottom int) {
 
 // listGeom: how many chat rows fit, and the index of the first one shown.
 func (m *tuiModel) listGeom(h int) (perPage, top int) {
-	perPage = max(1, (h-1-navRows)/2) // header on top, tab bar at the bottom (buttons float over the list)
+	perPage = max(1, (h-topRows-navRows)/itemRows) // top bar, tab bar at the bottom (buttons float over the list)
 	if len(m.shown) > perPage {
 		top = clamp(m.sel-perPage/2, 0, len(m.shown)-perPage)
 	}
@@ -2122,23 +2237,7 @@ func (m *tuiModel) renderList(w, h int) []string {
 	for i := range rows {
 		rows[i] = blankRow(fabRowW(w, i, h-navRows))
 	}
-	dotFg := lipgloss.Color("#F15C6D")
-	if m.online {
-		dotFg = th.accent
-	}
-	if m.filtering {
-		v := m.filter.View()
-		if pad := w - lipgloss.Width(v); pad > 0 {
-			v += blankRow(pad)
-		}
-		rows[0] = v
-	} else {
-		rows[0] = render(th.bar, w,
-			seg{t: " ●", fg: dotFg},
-			seg{t: " WhatsApp", fg: th.text, bold: true},
-			seg{t: spaces(max(1, w-13))},
-			seg{t: "⋮ ", fg: th.text, bold: true})
-	}
+	copy(rows, m.topBar(w))
 	if m.searching() {
 		return m.renderResults(rows, w, h)
 	}
@@ -2147,8 +2246,8 @@ func (m *tuiModel) renderList(w, h int) []string {
 		if m.tab == 3 {
 			t1, t2 = " No unread chats 🎉", " You're all caught up"
 		}
-		rows[1] = bgr(w, seg{t: trunc(t1, w), fg: th.dim})
-		rows[2] = bgr(w, seg{t: trunc(t2, w), fg: th.dim})
+		rows[topRows] = bgr(w, seg{t: trunc(t1, w), fg: th.dim})
+		rows[topRows+1] = bgr(w, seg{t: trunc(t2, w), fg: th.dim})
 	}
 	perPage, top := m.listGeom(h)
 	for i := 0; i < perPage; i++ {
@@ -2156,19 +2255,23 @@ func (m *tuiModel) renderList(w, h int) []string {
 		if idx >= len(m.shown) {
 			break
 		}
-		r := 1 + i*2
-		if r+1 >= h-navRows {
+		r := topRows + i*itemRows
+		if r+itemRows > h-navRows {
 			break
 		}
-		l1, l2 := m.listItem(m.shown[idx], idx == m.sel, w)
-		if rw := fabRowW(w, r+1, h-navRows); rw != w { // row(s) beside the floating buttons
-			n1, n2 := m.listItem(m.shown[idx], idx == m.sel, rw)
-			if fabRowW(w, r, h-navRows) != w {
-				l1 = n1
+		full := m.listCard(m.shown[idx], idx == m.sel, w)
+		var narrow [itemRows]string
+		haveNarrow := false
+		for k := 0; k < itemRows; k++ {
+			line := full[k]
+			if rw := fabRowW(w, r+k, h-navRows); rw != w { // row beside the floating buttons
+				if !haveNarrow {
+					narrow, haveNarrow = m.listCard(m.shown[idx], idx == m.sel, rw), true
+				}
+				line = narrow[k]
 			}
-			l2 = n2
+			rows[r+k] = line
 		}
-		rows[r], rows[r+1] = l1, l2
 	}
 	// WhatsApp-style tab bar at the very bottom; the two buttons float above it, bottom right
 	rows[h-2], rows[h-1] = m.navBar(w)
@@ -2241,31 +2344,30 @@ func (m *tuiModel) contactItem(c Contact, selected bool, w int) (string, string)
 	return l1, l2
 }
 
+// listIndent: columns taken by the margin + avatar block + gap before the chat text.
+const listIndent = 7
+
 func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 	bg := th.bg
 	if selected {
 		bg = th.sel
 	}
 	name := clean(c.Title())
-	av := runewidth.FillRight(runewidth.Truncate(initials(name), 2, ""), 2)
+	ini := runewidth.FillRight(runewidth.Truncate(initials(name), 2, ""), 2)
+	avBg := avatarBgs[hashIdx(c.JID, len(avatarBgs))]
 	tm := listTime(c.LastTS)
 	tmW := runewidth.StringWidth(tm)
-	nameFg, tmFg := th.text, th.dim
+	tmFg := th.dim
 	if c.Unread > 0 {
 		tmFg = th.accent
 	}
-	starW, star := 0, ""
-	if m.pinned[c.JID] {
-		starW, star = 2, " ★"
-	}
-	nm := trunc(name, max(1, w-5-tmW-1-starW))
-	gap := max(1, w-4-runewidth.StringWidth(nm)-starW-tmW-1)
+	nm := trunc(name, max(1, w-listIndent-tmW-1))
+	gap := max(1, w-listIndent-runewidth.StringWidth(nm)-tmW-1)
 	l1 := render(bg, w,
 		seg{t: " "},
-		seg{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(c.JID, len(avatarBgs))], bold: true},
-		seg{t: " "},
-		seg{t: nm, fg: nameFg, bold: c.Unread > 0},
-		seg{t: star, fg: warnColor},
+		seg{t: " " + ini + " ", fg: "#FFFFFF", bg: avBg, bold: true}, // 4x2 avatar block
+		seg{t: "  "},
+		seg{t: nm, fg: th.text, bold: true},
 		seg{t: spaces(gap)},
 		seg{t: tm, fg: tmFg},
 	)
@@ -2276,7 +2378,14 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 	} else if c.Unread > 0 {
 		badge = fmt.Sprintf(" %d ", c.Unread)
 	}
-	bw := runewidth.StringWidth(badge)
+	pin, pinW := "", 0
+	if m.pinned[c.JID] {
+		pin, pinW = "📌", 2
+	}
+	rightW := runewidth.StringWidth(badge) + pinW
+	if badge != "" && pin != "" {
+		rightW++ // space between badge and pin
+	}
 	pvText := strings.ReplaceAll(clean(prettyPreview(c.LastText)), "\n", " ")
 	pvFg, pvItal := th.dim, false
 	draftPfx := ""
@@ -2287,16 +2396,129 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 		pvText = strings.ReplaceAll(clean(d), "\n", " ")
 	}
 	pfxW := runewidth.StringWidth(draftPfx)
-	pv := trunc(pvText, max(1, w-4-bw-1-pfxW))
-	gap2 := max(0, w-4-pfxW-runewidth.StringWidth(pv)-bw-1)
+	pv := trunc(pvText, max(1, w-listIndent-pfxW-rightW-2))
+	gap2 := max(0, w-listIndent-pfxW-runewidth.StringWidth(pv)-rightW-1)
 	l2 := render(bg, w,
-		seg{t: "    "},
+		seg{t: " "},
+		seg{t: "    ", bg: avBg}, // second row of the avatar block
+		seg{t: "  "},
 		seg{t: draftPfx, fg: draftColor},
 		seg{t: pv, fg: pvFg, ital: pvItal},
 		seg{t: spaces(gap2)},
 		seg{t: badge, fg: th.bg, bg: th.accent, bold: true},
+		seg{t: func() string {
+			if badge != "" && pin != "" {
+				return " "
+			}
+			return ""
+		}()},
+		seg{t: pin, fg: th.dim},
 	)
 	return l1, l2
+}
+
+// cardIndent: 1 margin + 6 avatar columns + 2 gap before the chat text.
+const cardIndent = 9
+
+// avatarRows draws a round-looking 6x3 avatar: half blocks round the top and bottom edge,
+// the middle row carries the initials.
+func avatarRows(name string, avBg lipgloss.Color) [3]seg {
+	ini := initials(name)
+	ini = runewidth.Truncate(ini, 2, "")
+	iw := runewidth.StringWidth(ini)
+	l := (6 - iw) / 2
+	return [3]seg{
+		{t: spaces(6), bg: avBg},
+		{t: spaces(l) + ini + spaces(6-iw-l), fg: "#FFFFFF", bg: avBg, bold: true},
+		{t: spaces(6), bg: avBg},
+	}
+}
+
+// listCard renders one chat of the list as a WhatsApp-style card (itemRows rows):
+// round avatar on the left, bold name + time, preview (+ unread bubble / pin) below.
+func (m *tuiModel) listCard(c Chat, selected bool, w int) [itemRows]string {
+	bg := th.bg
+	if selected {
+		bg = th.sel
+	}
+	name := clean(c.Title())
+	av := avatarRows(name, avatarBgs[hashIdx(c.JID, len(avatarBgs))])
+
+	// row 0: name ............ time
+	tm := listTime(c.LastTS)
+	tmW := runewidth.StringWidth(tm)
+	tmFg := th.dim
+	if c.Unread > 0 {
+		tmFg = th.accent
+	}
+	nm := trunc(name, max(1, w-cardIndent-tmW-2))
+	gap := max(1, w-cardIndent-runewidth.StringWidth(nm)-tmW-1)
+	l0 := render(bg, w,
+		seg{t: " "}, av[0], seg{t: "  "},
+		seg{t: nm, fg: th.text, bold: true},
+		seg{t: spaces(gap)},
+		seg{t: tm, fg: tmFg},
+	)
+
+	// row 1: preview ............ unread bubble / pin
+	badge := ""
+	if c.Unread > 99 {
+		badge = "99+"
+	} else if c.Unread > 0 {
+		badge = strconv.Itoa(c.Unread)
+	}
+	badgeW := 0
+	if badge != "" {
+		badgeW = runewidth.StringWidth(badge) + 2 // soft caps on both sides
+	}
+	pinW := 0
+	if m.pinned[c.JID] {
+		pinW = 2
+	}
+	rightW := badgeW + pinW
+	if badgeW > 0 && pinW > 0 {
+		rightW++
+	}
+	pvText := strings.ReplaceAll(clean(prettyPreview(c.LastText)), "\n", " ")
+	pvFg, pvItal := th.dim, false
+	if c.Unread > 0 {
+		pvFg = th.text // unread chats get a brighter preview
+	}
+	draftPfx := ""
+	if until, ok := m.typingIn[c.JID]; ok && time.Now().Before(until) {
+		pvText, pvFg, pvItal = "typing…", th.accent, true // live typing indicator
+	} else if d := m.draftFor(c.JID); d != "" {
+		draftPfx = "Draft: " // unsent text, in red
+		pvText = strings.ReplaceAll(clean(d), "\n", " ")
+	}
+	pfxW := runewidth.StringWidth(draftPfx)
+	pv := trunc(pvText, max(1, w-cardIndent-pfxW-rightW-2))
+	gap2 := max(0, w-cardIndent-pfxW-runewidth.StringWidth(pv)-rightW-1)
+	tail := []seg{}
+	if badgeW > 0 {
+		tail = append(tail,
+			seg{t: " ", bg: th.accent},
+			seg{t: badge, fg: th.bg, bg: th.accent, bold: true},
+			seg{t: " ", bg: th.accent})
+	}
+	if badgeW > 0 && pinW > 0 {
+		tail = append(tail, seg{t: " "})
+	}
+	if pinW > 0 {
+		tail = append(tail, seg{t: "📌", fg: th.dim})
+	}
+	segs := []seg{
+		{t: " "}, av[1], {t: "  "},
+		{t: draftPfx, fg: draftColor},
+		{t: pv, fg: pvFg, ital: pvItal},
+		{t: spaces(gap2)},
+	}
+	l1 := render(bg, w, append(segs, tail...)...)
+
+	// row 2: bottom of the avatar; row 3: empty gap between chats
+	l2 := render(bg, w, seg{t: " "}, av[2])
+	l3 := render(th.bg, w)
+	return [itemRows]string{l0, l1, l2, l3}
 }
 
 func presSeg(p PresenceInfo, typing bool) seg {
@@ -2603,7 +2825,7 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID ma
 	for _, core := range cores {
 		var segs []seg
 		if selected {
-			segs = append(segs, seg{t: "▌", fg: th.accent}, seg{t: lead[1:]})
+			segs = append(segs, seg{t: " ", bg: th.accent}, seg{t: lead[1:]})
 		} else {
 			segs = append(segs, seg{t: lead})
 		}
@@ -3194,7 +3416,7 @@ func (m *tuiModel) moveRes(d int) {
 }
 
 func (m *tuiModel) resGeom(h int) (perPage, top int) {
-	perPage = max(1, (h-4)/2)
+	perPage = max(1, (h-topRows-2)/2)
 	if len(m.res) > perPage {
 		top = clamp(m.rsel-perPage/2, 0, len(m.res)-perPage)
 	}
@@ -3214,13 +3436,13 @@ func (m *tuiModel) openRes() tea.Cmd {
 }
 
 func (m *tuiModel) renderResults(rows []string, w, h int) []string {
-	for i := 2; i < h-1; i++ { // rows beside the floating buttons are narrower
+	for i := topRows; i < h-1; i++ { // rows beside the floating buttons are narrower
 		rows[i] = blankRow(fabRowW(w, i, h-1))
 	}
-	rows[1] = render(th.bar, w, seg{t: trunc(fmt.Sprintf(" Results  %d", len(m.res)), w), fg: th.accent, bold: true})
+	rows[topRows-1] = render(th.bar, w, seg{t: trunc(fmt.Sprintf(" Results  %d", len(m.res)), w), fg: th.accent, bold: true})
 	if len(m.res) == 0 {
-		rows[2] = bgr(w, seg{t: trunc(" No matches", w), fg: th.dim})
-		rows[3] = bgr(w, seg{t: trunc(" Try a name, a number or a word", w), fg: th.dim})
+		rows[topRows] = bgr(w, seg{t: trunc(" No matches", w), fg: th.dim})
+		rows[topRows+1] = bgr(w, seg{t: trunc(" Try a name, a number or a word", w), fg: th.dim})
 	}
 	perPage, top := m.resGeom(h)
 	for i := 0; i < perPage; i++ {
@@ -3228,7 +3450,7 @@ func (m *tuiModel) renderResults(rows []string, w, h int) []string {
 		if idx >= len(m.res) {
 			break
 		}
-		r := 2 + i*2
+		r := topRows + i*2
 		if r+1 >= h-1 {
 			break
 		}
