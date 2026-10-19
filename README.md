@@ -1,72 +1,108 @@
-# wacli — WhatsApp CLI + TUI for Termux (Go, whatsmeow)
+<p align="center">
+  <img src="assets/banner.svg" alt="wacli: WhatsApp from your terminal" width="100%">
+</p>
 
-Unofficial: uses the WhatsApp Web multi-device protocol via
-[whatsmeow](https://github.com/tulir/whatsmeow). Automated clients can in
-theory get an account restricted — use it for your own personal chats.
+<p align="center">
+  <a href="LICENSE"><img alt="License: MPL-2.0" src="https://img.shields.io/badge/license-MPL--2.0-00A884?style=flat-square"></a>
+  <img alt="Written in Go" src="https://img.shields.io/badge/Go-00ADD8?style=flat-square&logo=go&logoColor=white">
+  <img alt="Made for Termux" src="https://img.shields.io/badge/made%20for-Termux-1E1E1E?style=flat-square">
+  <img alt="Encrypted at rest" src="https://img.shields.io/badge/encrypted-AES--256--GCM-005C4B?style=flat-square">
+</p>
 
-## Install (Termux)
+<p align="center">
+  Chat, send files and get notified, all from a terminal on your phone.<br>
+  Built on <a href="https://github.com/tulir/whatsmeow">whatsmeow</a> and the WhatsApp Web multi-device protocol.
+</p>
 
-    pkg update && pkg install golang clang git termux-api unzip
-    termux-setup-storage            # gives ~/storage/downloads (media goes to .../wacli)
-    # install the "Termux:API" app too (F-Droid) for notifications
+> [!WARNING]
+> wacli is an **unofficial** project and is not affiliated with or endorsed by WhatsApp or Meta.
+> Automated clients can get an account restricted, so use it for your own personal chats.
 
-    unzip ~/storage/downloads/wacli.zip -d ~ && cd ~/wacli
-    go mod tidy                     # downloads dependencies (needs internet, first time is slow)
-    go build -o $PREFIX/bin/wacli . # cgo sqlite compiles for a few minutes the first time
+## Features
 
-## First run
+- **Full-screen TUI** with chats, groups, channels and five themes
+- **Scriptable CLI** for sending, reading, reacting, editing and downloading, with `--json` output
+- **Pairing code login**, so no QR scan is needed
+- **Background daemon** that stays connected and sends Termux notifications
+- **Encrypted storage**: keys and messages live in one passphrase-protected database
 
-    wacli login 94771234567         # your number with country code
-    # -> choose a passphrase (encrypts everything), get an 8-char pairing code
-    # -> WhatsApp > Settings > Linked devices > Link a device >
-    #    "Link with phone number instead" > type the code
+## Install
 
-    wacli daemon start              # asks passphrase once, stays connected, notifications on
-    wacli                           # TUI (talks to the daemon, no passphrase prompt)
+```bash
+pkg update && pkg install golang clang git termux-api
+termux-setup-storage        # lets wacli save media to your Downloads folder
 
-Without the daemon every command asks the passphrase, connects, does its job,
-disconnects. With it, commands are instant.
+git clone https://github.com/bhawan-kavinda/wacli.git && cd wacli
+go mod tidy
+go build -o $PREFIX/bin/wacli .
+```
+
+The first build compiles SQLite and can take a few minutes.
+For notifications, also install the **Termux:API** app from F-Droid.
+
+## Quick start
+
+```bash
+wacli login 94771234567     # your number with country code, then choose a passphrase
+```
+
+Enter the 8-character code in WhatsApp under **Settings → Linked devices → Link a device → Link with phone number instead**.
+
+```bash
+wacli daemon start          # unlock once, stay connected
+wacli                       # open the TUI
+```
+
+Without the daemon, each command asks for your passphrase, does its job and disconnects.
 
 ## Commands
 
-    wacli chats | contacts [q] | groups [name] | msgs <chat> -n 30
-    wacli send mom "hello"          wacli send mom - < note.txt
-    wacli send mom "yes" --reply 3EB0A1B2
-    wacli sendfile mom ~/pic.jpg "caption"
-    wacli get mom 3EB0A1B2          # saves to ~/storage/downloads/wacli
-    wacli react mom 3EB0A1B2 👍     wacli edit mom 3EB0A1B2 "fixed"     wacli rm mom 3EB0A1B2
-    wacli read mom                  # blue ticks
-    wacli presence mom              wacli watch [chat]
-    wacli alias set mom 94771234567
-    wacli config set notifications off     (also: send_read_receipts, send_typing, download_dir)
+```bash
+wacli chats                            # list chats
+wacli msgs mom -n 30                   # read the last 30 messages
+wacli send mom "hello"                 # use - to read text from stdin
+wacli send mom "yes" --reply 3EB0A1B2  # reply to a message
+wacli sendfile mom ~/pic.jpg "caption"
+wacli get mom 3EB0A1B2                 # download media
+wacli react mom 3EB0A1B2 👍
+wacli read mom                         # mark as read
+wacli watch                            # live stream of messages and typing
+```
 
-Add `--json` to list/show commands for scripting. `<chat>` can be an alias,
-a (fuzzy) contact/group name, a phone number or a JID.
+Also available: `contacts`, `groups`, `edit`, `rm`, `presence`, `alias` and `config`. Run `wacli help` for the full list.
+`<chat>` can be an alias, a contact or group name (fuzzy), a phone number or a JID.
 
 ## TUI keys
 
-List: j/k or ↑/↓ move · Enter open · q quit.
-Chat: type + Enter send · ↑/↓ PgUp/PgDn scroll · Esc/Tab back to list.
-Slash commands (N = the message number shown at the start of each line):
-`/r N text` reply · `/react N 👍` · `/edit N text` · `/del N` · `/get N` ·
-`/file path [caption]` · `/help`.
-Ticks: ✓ sent · ✓✓ delivered · ✔✔ read.
-Screens narrower than 70 columns show one pane at a time.
+| Where | Keys |
+| --- | --- |
+| List | `j` `k` or `↑` `↓` move, `Enter` open, `q` quit |
+| Chat | type and `Enter` send, `PgUp` `PgDn` scroll, `Esc` back |
+| Slash commands | `/r N text` · `/react N 👍` · `/edit N text` · `/del N` · `/get N` · `/file path` · `/theme` · `/help` |
 
-## Security model
+`N` is the message number shown at the start of each line. Ticks: ✓ sent, ✓✓ delivered, blue ✓✓ read.
 
-Everything (WhatsApp keys + all messages) is one SQLite DB, stored on disk only as
-`~/.wacli/wacli.db.enc` (AES-256-GCM, key = argon2id(passphrase)). While wacli
-runs, a decrypted working copy lives in Termux's private temp dir and is
-re-encrypted every 2 minutes and on exit. After a hard kill a plaintext copy can
-remain in `$TMPDIR/wacli-<uid>/` until the next start — then it is picked up
-and re-encrypted. Forgetting the passphrase = data lost (just `rm -r ~/.wacli`
-and log in again).
+## Security
 
-## Known limits
+Everything is stored in one SQLite database, kept on disk only as `~/.wacli/wacli.db.enc`
+(AES-256-GCM, key derived with argon2id from your passphrase).
 
-* Chat list is built from messages that arrive/are sent while wacli runs;
-  WhatsApp's old history is not imported. Contacts and groups come from WhatsApp.
-* Media can only be downloaded for messages received while wacli was running.
-* Presence (online/last seen) is only visible for contacts that allow it.
-* Debug: `WACLI_DEBUG=1 wacli ...`; daemon log: `~/.wacli/daemon.log`.
+While wacli runs, a decrypted working copy lives in Termux's private temp directory and is re-encrypted every 2 minutes and on exit.
+After a hard kill, a leftover copy in `$TMPDIR/wacli-<uid>/` is re-encrypted on the next start.
+
+**Forget the passphrase and the data is gone.** Run `rm -r ~/.wacli` and log in again.
+
+## Good to know
+
+- Chats are built from messages sent or received while wacli is running. Old WhatsApp history is not imported.
+- Media can only be downloaded for messages received while wacli was running.
+- Presence (online, last seen) is visible only for contacts who allow it.
+- Debug with `WACLI_DEBUG=1 wacli ...`. The daemon log is at `~/.wacli/daemon.log`.
+
+## License
+
+wacli is released under the [Mozilla Public License 2.0](LICENSE).
+Modified versions of the covered source files must stay under the same license, and their source must be made available when distributed.
+
+It builds on [whatsmeow](https://github.com/tulir/whatsmeow) (MPL-2.0) and the [Charm](https://charm.sh) terminal libraries.
+WhatsApp is a trademark of Meta Platforms, Inc.
