@@ -117,6 +117,8 @@ func (e *Engine) dispatch(req Req, shutdown chan<- struct{}) (any, error) {
 		return call1(p, func(Empty) ([]Group, error) { return e.Groups() })
 	case "messages":
 		return call1(p, e.Messages)
+	case "search":
+		return call1(p, e.Search)
 	case "resolve":
 		return call1(p, e.Resolve)
 	case "send":
@@ -207,6 +209,9 @@ func (r *Remote) Contacts() ([]Contact, error) { return rcall[[]Contact](r, "con
 func (r *Remote) Groups() ([]Group, error)     { return rcall[[]Group](r, "groups", nil) }
 func (r *Remote) Messages(q MsgQuery) ([]Message, error) {
 	return rcall[[]Message](r, "messages", q)
+}
+func (r *Remote) Search(a SearchArgs) ([]SearchHit, error) {
+	return rcall[[]SearchHit](r, "search", a)
 }
 func (r *Remote) Resolve(s string) (string, error)     { return rcall[string](r, "resolve", s) }
 func (r *Remote) Send(a SendArgs) (SendResult, error)  { return rcall[SendResult](r, "send", a) }

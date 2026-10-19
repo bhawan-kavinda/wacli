@@ -76,8 +76,11 @@ Also available: `contacts`, `groups`, `edit`, `rm`, `presence`, `alias` and `con
 
 | Where | Keys |
 | --- | --- |
-| List | `j` `k` or `↑` `↓` move, `Enter` open, `q` quit |
+| List | `j` `k` or `↑` `↓` move, `Enter` open, `1`-`4` or `←` `→` tabs (Chats, Groups, Channels, Unread), `u` unread tab, `c` contacts / new chat, `p` pin ★ / unpin, `d` home dashboard, `q` quit |
 | Chat | type and `Enter` send, `PgUp` `PgDn` scroll, `Esc` back |
+| Search | `/` searches chats, contacts (even with no history) and message text; `Enter` opens the hit |
+| Drafts | unsent text is kept per chat (also after closing wacli); pasted multi-line text stays one message until you press `Enter` |
+| Touch | tap a chat, tab or the `+ Contacts` button; swipe to scroll; tap a message to pick it |
 | Slash commands | `/r N text` · `/react N 👍` · `/edit N text` · `/del N` · `/get N` · `/file path` · `/theme` · `/help` |
 
 `N` is the message number shown at the start of each line. Ticks: ✓ sent, ✓✓ delivered, blue ✓✓ read.

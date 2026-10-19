@@ -41,6 +41,11 @@ var themes = map[string]theme{
 var th = themes["whatsapp"]
 
 const warnColor = lipgloss.Color("#FFB000")
+const draftColor = lipgloss.Color("#F15C6D")
+
+// Keys arriving closer together than this are a paste, not typing: an Enter inside
+// a paste becomes a new line instead of sending the message.
+const pasteGap = 40 * time.Millisecond
 
 func themeNames() []string {
 	names := make([]string, 0, len(themes))
@@ -274,7 +279,15 @@ func chatKind(jid string) int {
 	return 0
 }
 
-func tabName(k int) string { return [...]string{"Chats", "Groups", "Channels"}[k] }
+func tabName(k int) string  { return [...]string{"Chats", "Groups", "Channels", "Unread"}[k] }
+func tabShort(k int) string { return [...]string{"Chats", "Grp", "Chan", "Unread"}[k] }
+
+func unreadLabel(n int) string {
+	if n > 99 {
+		return "99+"
+	}
+	return strconv.Itoa(n)
+}
 
 // hintRow draws "key label" pairs, dropping the ones that don't fit.
 func hintRow(w int, pairs ...string) string {
@@ -306,6 +319,21 @@ type presMsg struct {
 	chat string
 	p    PresenceInfo
 }
+type contactsMsg []Contact
+type searchMsg struct {
+	q    string
+	hits []SearchHit
+}
+
+// searchRes is one row of the global search results (chat, contact or message).
+type searchRes struct {
+	kind  int // 0 chat, 1 contact (no history), 2 message
+	jid   string
+	title string
+	sub   string
+	ts    int64
+	msgID string
+}
 type errMsg struct{ err error }
 type evMsg Event
 type evClosedMsg struct{}
@@ -315,6 +343,7 @@ type tuiModel struct {
 	be     Backend
 	w, h   int
 	online bool
+	st     Status // account info for the dashboard
 
 	chats     []Chat
 	shown     []Chat
@@ -344,6 +373,33 @@ type tuiModel struct {
 	confirmDel bool
 	showHelp   bool
 
+	// contacts picker (WhatsApp-style "new chat")
+	contactsMode bool
+	contacts     []Contact
+	cshown       []Contact
+	csel         int
+	cfilter      textinput.Model
+
+	// home dashboard
+	showDash bool
+	dashHits []dashHit
+
+	// drafts (kept per chat, saved to ~/.wacli/drafts.json)
+	drafts  map[string]string
+	lines   []string // finished lines of a multi-line paste; sent together as ONE message
+	lastKey time.Time
+	tickN   int
+
+	// global search (the / box)
+	res        []searchRes
+	rsel       int
+	hits       []SearchHit
+	jumpID     string
+	contactsOK bool
+
+	typingIn map[string]time.Time // chats where someone is typing right now (list preview)
+	pinned   map[string]bool      // pinned chats (★), saved in config.json
+
 	status string
 	events <-chan Event
 	cancel func()
@@ -357,6 +413,9 @@ func (m *tuiModel) restyle() {
 	m.filter.PromptStyle = m.input.PromptStyle
 	m.filter.TextStyle = m.input.TextStyle
 	m.filter.PlaceholderStyle = m.input.PlaceholderStyle
+	m.cfilter.PromptStyle = m.input.PromptStyle
+	m.cfilter.TextStyle = m.input.TextStyle
+	m.cfilter.PlaceholderStyle = m.input.PlaceholderStyle
 }
 
 func runTUI(b Backend) error {
@@ -367,19 +426,27 @@ func runTUI(b Backend) error {
 	ti := textinput.New()
 	ti.Prompt = "❯ "
 	ti.Placeholder = "Type a message…  (/help)"
-	ti.CharLimit = 4000
+	ti.CharLimit = 60000
 	fi := textinput.New()
 	fi.Prompt = "🔍 "
 	fi.Placeholder = "search"
 
-	m := &tuiModel{be: b, input: ti, filter: fi, selMsg: -1}
+	ci := textinput.New()
+	ci.Prompt = "🔍 "
+	ci.Placeholder = "name or number"
+
+	m := &tuiModel{be: b, input: ti, filter: fi, cfilter: ci, selMsg: -1,
+		typingIn: map[string]time.Time{}, pinned: map[string]bool{}, drafts: loadDrafts()}
+	for _, j := range loadConfig().Pinned {
+		m.pinned[j] = true
+	}
 	m.restyle()
 	if ch, cancel, err := b.Subscribe(); err == nil {
 		m.events, m.cancel = ch, cancel
 	} else {
 		m.status = "⚠ live updates unavailable: " + err.Error()
 	}
-	p := tea.NewProgram(m, tea.WithAltScreen())
+	p := tea.NewProgram(m, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := p.Run()
 	return err
 }
@@ -412,6 +479,17 @@ func (m *tuiModel) loadChats() tea.Cmd {
 			return errMsg{err}
 		}
 		return chatsMsg(cs)
+	}
+}
+
+func (m *tuiModel) loadContacts() tea.Cmd {
+	be := m.be
+	return func() tea.Msg {
+		cs, err := be.Contacts()
+		if err != nil {
+			return errMsg{err}
+		}
+		return contactsMsg(cs)
 	}
 }
 
@@ -504,14 +582,48 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.w, m.h = msg.Width, msg.Height
 		m.input.Width = max(8, m.paneWidths()[1]-4)
 		m.filter.Width = max(8, m.paneWidths()[0]-6)
+		m.cfilter.Width = max(8, m.paneWidths()[0]-6)
+	case contactsMsg:
+		var out []Contact
+		for _, c := range []Contact(msg) {
+			if chatKind(c.JID) != 0 || (strings.TrimSpace(c.Name) == "" && c.Phone == "") {
+				continue
+			}
+			out = append(out, c)
+		}
+		m.contacts = out
+		m.contactsOK = true
+		m.refilterContacts()
+		if m.searching() {
+			m.rebuildResults()
+		}
+	case searchMsg:
+		if msg.q == strings.TrimSpace(m.filter.Value()) {
+			m.hits = msg.hits
+			m.rebuildResults()
+		}
 	case chatsMsg:
 		m.chats = []Chat(msg)
 		m.refilter()
+		if m.searching() {
+			m.rebuildResults()
+		}
 	case statusMsg:
+		m.st = Status(msg)
 		m.online = msg.Connected
 	case msgsMsg:
 		if msg.chat == m.cur {
 			m.msgs = msg.msgs
+			if m.jumpID != "" { // opened from a message search hit: jump to that message
+				for i, mm := range m.msgs {
+					if mm.ID == m.jumpID {
+						m.selMsg = i
+						m.input.Blur()
+						break
+					}
+				}
+				m.jumpID = ""
+			}
 			if m.selMsg >= len(m.msgs) {
 				m.selMsg = len(m.msgs) - 1
 			}
@@ -526,8 +638,18 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case errMsg:
 		m.status = "⚠ " + msg.err.Error()
 	case tickMsg:
-		if m.typing && time.Now().After(m.typingUntil) {
+		now := time.Now()
+		if m.typing && now.After(m.typingUntil) {
 			m.typing = false
+		}
+		for j, until := range m.typingIn {
+			if now.After(until) {
+				delete(m.typingIn, j)
+			}
+		}
+		m.tickN++
+		if m.inChat && m.tickN%3 == 0 {
+			m.syncDraft() // keep the draft on disk while typing
 		}
 		return m, tickCmd()
 	case evClosedMsg:
@@ -536,6 +658,8 @@ func (m *tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.onEvent(Event(msg))
 	case tea.KeyMsg:
 		return m.onKey(msg)
+	case tea.MouseMsg:
+		return m.onMouse(msg)
 	}
 	return m, nil
 }
@@ -544,6 +668,9 @@ func (m *tuiModel) onEvent(ev Event) (tea.Model, tea.Cmd) {
 	cmds := []tea.Cmd{m.waitEvent()}
 	switch ev.Type {
 	case "message", "update":
+		if ev.Type == "message" && ev.Msg != nil && !ev.Msg.FromMe {
+			delete(m.typingIn, ev.Chat) // they sent it, so they stopped typing
+		}
 		cmds = append(cmds, m.loadChats())
 		if ev.Chat != "" && ev.Chat == m.cur {
 			cmds = append(cmds, m.loadMsgs(m.cur))
@@ -556,12 +683,20 @@ func (m *tuiModel) onEvent(ev Event) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.loadPresence(m.cur))
 		}
 	case "typing":
+		if ev.Chat != "" {
+			if ev.On {
+				m.typingIn[ev.Chat] = time.Now().Add(7 * time.Second)
+			} else {
+				delete(m.typingIn, ev.Chat)
+			}
+		}
 		if ev.Chat == m.cur {
 			m.typing = ev.On
 			m.typingUntil = time.Now().Add(7 * time.Second)
 		}
 	case "connected":
 		m.online = true
+		cmds = append(cmds, m.loadStatus())
 	case "disconnected":
 		m.online = false
 	}
@@ -578,17 +713,38 @@ func (m *tuiModel) tabList() []int {
 			break
 		}
 	}
-	return list
+	return append(list, 3) // 3 = Unread
 }
 
 func (m *tuiModel) tabUnread(kind int) int {
 	n := 0
 	for _, c := range m.chats {
-		if chatKind(c.JID) == kind {
+		k := chatKind(c.JID)
+		if k < 0 {
+			continue
+		}
+		if kind == 3 || k == kind {
 			n += c.Unread
 		}
 	}
 	return n
+}
+
+// unreadChats: every visible chat with unread messages, most unread first.
+func (m *tuiModel) unreadChats() []Chat {
+	var out []Chat
+	for _, c := range m.chats {
+		if chatKind(c.JID) >= 0 && c.Unread > 0 {
+			out = append(out, c)
+		}
+	}
+	sort.SliceStable(out, func(i, j int) bool {
+		if out[i].Unread != out[j].Unread {
+			return out[i].Unread > out[j].Unread
+		}
+		return out[i].LastTS > out[j].LastTS
+	})
+	return out
 }
 
 func (m *tuiModel) setTab(k int) {
@@ -622,7 +778,12 @@ func (m *tuiModel) refilter() {
 	q := strings.TrimSpace(m.filter.Value())
 	var out []Chat
 	for _, c := range m.chats {
-		if chatKind(c.JID) != m.tab {
+		k := chatKind(c.JID)
+		if m.tab == 3 {
+			if k < 0 || c.Unread == 0 {
+				continue
+			}
+		} else if k != m.tab {
 			continue
 		}
 		if m.filtering && q != "" && fuzzyScore(q, c.Title()) == 0 {
@@ -630,8 +791,47 @@ func (m *tuiModel) refilter() {
 		}
 		out = append(out, c)
 	}
+	if len(m.pinned) > 0 { // pinned chats go to the top, order otherwise unchanged
+		var top, rest []Chat
+		for _, c := range out {
+			if m.pinned[c.JID] {
+				top = append(top, c)
+			} else {
+				rest = append(rest, c)
+			}
+		}
+		out = append(top, rest...)
+	}
 	m.shown = out
 	m.fixSel()
+}
+
+// togglePin pins / unpins a chat and saves the list to config.json.
+func (m *tuiModel) togglePin(jid string) bool {
+	if jid == "" {
+		return false
+	}
+	if m.pinned[jid] {
+		delete(m.pinned, jid)
+	} else {
+		m.pinned[jid] = true
+	}
+	cfg := loadConfig()
+	var list []string
+	seen := map[string]bool{}
+	for _, j := range cfg.Pinned { // keep the saved order for chats that stay pinned
+		if m.pinned[j] && !seen[j] {
+			list = append(list, j)
+			seen[j] = true
+		}
+	}
+	if m.pinned[jid] && !seen[jid] {
+		list = append(list, jid)
+	}
+	cfg.Pinned = list
+	_ = cfg.Save()
+	m.refilter()
+	return m.pinned[jid]
 }
 
 func (m *tuiModel) fixSel() {
@@ -660,6 +860,7 @@ func (m *tuiModel) moveSel(d int) {
 }
 
 func (m *tuiModel) quit() tea.Cmd {
+	m.syncDraft()
 	if m.cancel != nil {
 		m.cancel()
 	}
@@ -688,7 +889,21 @@ func (m *tuiModel) openSel() tea.Cmd {
 		return nil
 	}
 	c := m.shown[m.sel]
-	m.cur, m.curName = c.JID, c.Title()
+	return m.openJID(c.JID, c.Title())
+}
+
+// openJID opens any chat, including a contact that has no history yet.
+func (m *tuiModel) openJID(jid, name string) tea.Cmd {
+	var prev tea.Cmd
+	m.syncDraft() // save what was typed in the chat we are leaving
+	if m.cur != "" && m.cur != jid {
+		prev = m.typingCmd(m.cur, false)
+	}
+	m.res, m.rsel = nil, 0
+	m.contactsMode = false
+	m.cfilter.Blur()
+	m.showDash = false
+	m.cur, m.curName = jid, name
 	m.msgs, m.scroll, m.pres, m.typing = nil, 0, PresenceInfo{}, false
 	m.resetChatState()
 	m.filtering = false
@@ -696,11 +911,15 @@ func (m *tuiModel) openSel() tea.Cmd {
 	m.filter.Blur()
 	m.refilter()
 	m.input.SetValue("")
+	m.lines = nil
+	if d := m.drafts[jid]; d != "" {
+		m.setDraft(d) // bring back the unsent text
+	}
 	m.inChat = true
 	m.input.Focus()
 	be := m.be
-	jid := c.JID
 	return tea.Batch(
+		prev,
 		textinput.Blink,
 		m.loadMsgs(jid),
 		m.markRead(jid),
@@ -710,6 +929,7 @@ func (m *tuiModel) openSel() tea.Cmd {
 }
 
 func (m *tuiModel) leaveChat() tea.Cmd {
+	m.syncDraft()
 	chat := m.cur
 	m.inChat = false
 	m.input.Blur()
@@ -771,6 +991,10 @@ func (m *tuiModel) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.showHelp = false
 		return m, nil
 	}
+	if m.showDash {
+		m.showDash = false
+		return m, nil
+	}
 	if !m.inChat {
 		return m.onListKey(k, s)
 	}
@@ -778,27 +1002,42 @@ func (m *tuiModel) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *tuiModel) onListKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
+	if m.contactsMode {
+		return m.onContactsKey(k, s)
+	}
 	if m.filtering {
 		switch s {
 		case "esc":
 			m.filtering = false
 			m.filter.SetValue("")
 			m.filter.Blur()
+			m.res, m.rsel = nil, 0
 			m.refilter()
 			return m, nil
 		case "enter":
+			if m.searching() {
+				return m, m.openRes()
+			}
 			return m, m.openSel()
 		case "up":
-			m.moveSel(-1)
+			if m.searching() {
+				m.moveRes(-1)
+			} else {
+				m.moveSel(-1)
+			}
 			return m, nil
 		case "down":
-			m.moveSel(1)
+			if m.searching() {
+				m.moveRes(1)
+			} else {
+				m.moveSel(1)
+			}
 			return m, nil
 		}
 		var cmd tea.Cmd
 		m.filter, cmd = m.filter.Update(k)
 		m.refilter()
-		return m, cmd
+		return m, tea.Batch(cmd, m.runSearch())
 	}
 	switch s {
 	case "q":
@@ -808,6 +1047,9 @@ func (m *tuiModel) onListKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 	case "/":
 		m.filtering = true
 		m.filter.Focus()
+		if !m.contactsOK {
+			return m, tea.Batch(textinput.Blink, m.loadContacts()) // contacts are searched too
+		}
 		return m, textinput.Blink
 	case "up", "k":
 		m.moveSel(-1)
@@ -827,6 +1069,23 @@ func (m *tuiModel) onListKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		m.setTab(1)
 	case "3":
 		m.setTab(2)
+	case "4":
+		m.setTab(3)
+	case "u":
+		if m.tab == 3 {
+			m.setTab(0)
+		} else {
+			m.setTab(3)
+		}
+	case "p":
+		if len(m.shown) > 0 {
+			m.selJID = m.shown[m.sel].JID // keep the cursor on this chat after it moves
+			m.togglePin(m.selJID)
+		}
+	case "c", "n":
+		return m, m.openContacts()
+	case "d":
+		m.showDash = true
 	case "enter":
 		return m, m.openSel()
 	case "tab":
@@ -889,6 +1148,7 @@ func (m *tuiModel) onChatKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		case "e":
 			if mm, ok := m.selected(); ok && mm.FromMe && mm.Kind == "text" && !mm.Deleted {
 				m.editID, m.hasReply = mm.ID, false
+				m.lines = nil
 				c := m.exitSelect()
 				m.input.SetValue(mm.Text)
 				return m, c
@@ -911,6 +1171,13 @@ func (m *tuiModel) onChatKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	now := time.Now()
+	burst := !m.lastKey.IsZero() && now.Sub(m.lastKey) < pasteGap
+	m.lastKey = now
+	if k.Paste && m.editID == "" && m.onPaste(k) {
+		return m, nil // multi-line paste: kept as one message, nothing is sent
+	}
+
 	switch s { // typing mode
 	case "esc":
 		if m.hasReply || m.editID != "" {
@@ -923,9 +1190,18 @@ func (m *tuiModel) onChatKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		}
 		return m, m.leaveChat()
 	case "tab":
+		m.syncDraft()
 		m.inChat = false
 		m.input.Blur()
 		return m, nil
+	case "backspace":
+		if m.input.Value() == "" && len(m.lines) > 0 && m.editID == "" {
+			last := m.lines[len(m.lines)-1] // take the last pasted line back into the box
+			m.lines = m.lines[:len(m.lines)-1]
+			m.input.SetValue(last)
+			m.input.CursorEnd()
+			return m, nil
+		}
 	case "up":
 		if m.input.Value() == "" && len(m.msgs) > 0 {
 			m.selMsg = len(m.msgs) - 1
@@ -947,6 +1223,11 @@ func (m *tuiModel) onChatKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		m.scroll = 0
 		return m, nil
 	case "enter":
+		if burst && m.editID == "" { // Enter inside a paste = new line, never "send"
+			m.lines = append(m.lines, m.input.Value())
+			m.input.SetValue("")
+			return m, nil
+		}
 		return m, m.submit()
 	}
 	before := m.input.Value()
@@ -959,6 +1240,316 @@ func (m *tuiModel) onChatKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		cmds = append(cmds, m.typingCmd(m.cur, true))
 	}
 	return m, tea.Batch(cmds...)
+}
+
+// ---- contacts picker
+
+func (m *tuiModel) openContacts() tea.Cmd {
+	m.contactsMode = true
+	m.inChat = false
+	m.input.Blur()
+	m.filtering = false
+	m.filter.SetValue("")
+	m.filter.Blur()
+	m.res, m.rsel = nil, 0
+	m.cfilter.SetValue("")
+	m.cfilter.Focus()
+	m.csel = 0
+	m.refilterContacts()
+	return tea.Batch(textinput.Blink, m.loadContacts())
+}
+
+func (m *tuiModel) closeContacts() {
+	m.contactsMode = false
+	m.cfilter.Blur()
+	m.cfilter.SetValue("")
+}
+
+func (m *tuiModel) refilterContacts() {
+	q := strings.TrimSpace(m.cfilter.Value())
+	if q == "" {
+		m.cshown = m.contacts
+		m.csel = clamp(m.csel, 0, max(0, len(m.cshown)-1))
+		return
+	}
+	type scored struct {
+		c Contact
+		s int
+	}
+	var tmp []scored
+	qd := digitsOnly(q)
+	for _, c := range m.contacts {
+		sc := fuzzyScore(q, c.Name)
+		if sc == 0 && len(qd) >= 2 && strings.Contains(c.Phone, qd) {
+			sc = 50
+		}
+		if sc > 0 {
+			tmp = append(tmp, scored{c, sc})
+		}
+	}
+	sort.SliceStable(tmp, func(i, j int) bool { return tmp[i].s > tmp[j].s })
+	out := make([]Contact, 0, len(tmp)+1)
+	// a number that is not in the address book can still be messaged
+	if isPhoneLike(q) {
+		exists := false
+		for _, t := range tmp {
+			if t.c.Phone == qd {
+				exists = true
+			}
+		}
+		if !exists {
+			out = append(out, Contact{JID: qd + "@s.whatsapp.net", Phone: qd})
+		}
+	}
+	for _, t := range tmp {
+		out = append(out, t.c)
+	}
+	m.cshown = out
+	m.csel = clamp(m.csel, 0, max(0, len(m.cshown)-1))
+}
+
+func (m *tuiModel) moveCSel(d int) {
+	if len(m.cshown) == 0 {
+		return
+	}
+	m.csel = clamp(m.csel+d, 0, len(m.cshown)-1)
+}
+
+func contactTitle(c Contact) string {
+	if strings.TrimSpace(c.Name) != "" {
+		return c.Name
+	}
+	if c.Phone != "" {
+		return "+" + c.Phone
+	}
+	return userPart(c.JID)
+}
+
+func (m *tuiModel) openContact(i int) tea.Cmd {
+	if i < 0 || i >= len(m.cshown) {
+		return nil
+	}
+	c := m.cshown[i]
+	m.cfilter.SetValue("")
+	return m.openJID(c.JID, contactTitle(c))
+}
+
+func (m *tuiModel) onContactsKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
+	switch s {
+	case "esc":
+		m.closeContacts()
+		return m, nil
+	case "enter":
+		return m, m.openContact(m.csel)
+	case "up":
+		m.moveCSel(-1)
+		return m, nil
+	case "down":
+		m.moveCSel(1)
+		return m, nil
+	case "pgup":
+		m.moveCSel(-5)
+		return m, nil
+	case "pgdown":
+		m.moveCSel(5)
+		return m, nil
+	}
+	var cmd tea.Cmd
+	m.cfilter, cmd = m.cfilter.Update(k)
+	m.refilterContacts()
+	return m, cmd
+}
+
+// ---- mouse / touch
+
+// paneSplit returns the width of the left and right panes and the x where the right pane starts.
+func (m *tuiModel) paneSplit() (lw, rw, rx0 int) {
+	pw := m.paneWidths()
+	lw, rw = pw[0], pw[1]
+	rx0 = m.w - rw
+	return
+}
+
+func (m *tuiModel) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action != tea.MouseActionPress {
+		return m, nil
+	}
+	if m.showHelp {
+		if msg.Button == tea.MouseButtonLeft {
+			m.showHelp = false
+		}
+		return m, nil
+	}
+	if m.showDash {
+		if msg.Button == tea.MouseButtonLeft {
+			for _, h := range m.dashHits {
+				if h.y == msg.Y {
+					return m, m.openJIDByChat(h.jid)
+				}
+			}
+			m.showDash = false
+		}
+		return m, nil
+	}
+	lw, rw, rx0 := m.paneSplit()
+	inLeft := lw > 0 && msg.X < lw
+	inRight := rw > 0 && msg.X >= rx0
+	switch msg.Button {
+	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
+		d := 1
+		if msg.Button == tea.MouseButtonWheelUp {
+			d = -1
+		}
+		switch {
+		case inLeft && m.contactsMode:
+			m.moveCSel(d * 2)
+		case inLeft && m.searching():
+			m.moveRes(d * 2)
+		case inLeft:
+			m.moveSel(d * 2)
+		case inRight && m.cur != "":
+			if m.selMsg >= 0 {
+				m.selMsg = clamp(m.selMsg+d, 0, len(m.msgs)-1)
+			} else if d < 0 {
+				m.scroll += 3
+			} else {
+				m.scroll = max(0, m.scroll-3)
+			}
+		}
+		return m, nil
+	case tea.MouseButtonLeft:
+		if inLeft {
+			return m.clickLeft(msg.X, msg.Y, lw)
+		}
+		if inRight {
+			return m.clickRight(msg.X-rx0, msg.Y, rw)
+		}
+	}
+	return m, nil
+}
+
+// openJIDByChat opens a chat that is (or may be) in the chat list.
+func (m *tuiModel) openJIDByChat(jid string) tea.Cmd {
+	for _, c := range m.chats {
+		if c.JID == jid {
+			return m.openJID(c.JID, c.Title())
+		}
+	}
+	return m.openJID(jid, userPart(jid))
+}
+
+func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
+	h := m.h
+	if m.contactsMode {
+		switch {
+		case y == 1: // "‹ Contacts" bar closes the picker
+			m.closeContacts()
+		case y >= 2 && y < h-1:
+			perPage, top := m.contactGeom(h)
+			i := top + (y-2)/2
+			if (y-2)/2 < perPage {
+				return m, m.openContact(i)
+			}
+		}
+		return m, nil
+	}
+	if m.searching() {
+		switch {
+		case y == h-2:
+			if x < contactsBtnW+2 {
+				return m, m.openContacts()
+			}
+		case y >= 2 && y < h-2:
+			perPage, top := m.resGeom(h)
+			slot := (y - 2) / 2
+			if slot < perPage && top+slot < len(m.res) {
+				m.rsel = top + slot
+				return m, m.openRes()
+			}
+		}
+		return m, nil
+	}
+	switch {
+	case y == 0 && !m.filtering:
+		m.showDash = true // tap the "● wacli" bar for the home dashboard
+	case y == 1:
+		for _, p := range m.tabLayout(w) {
+			if x >= p.x0 && x < p.x1 {
+				m.setTab(p.kind)
+			}
+		}
+	case y == h-2:
+		if x < contactsBtnW+2 {
+			return m, m.openContacts()
+		}
+	case y >= 2 && y < h-2:
+		perPage, top := m.listGeom(h)
+		slot := (y - 2) / 2
+		if slot < perPage && top+slot < len(m.shown) {
+			m.sel = top + slot
+			m.selJID = m.shown[m.sel].JID
+			return m, m.openSel()
+		}
+	}
+	return m, nil
+}
+
+func (m *tuiModel) clickRight(x, y, w int) (tea.Model, tea.Cmd) {
+	h := m.h
+	if m.cur == "" { // home dashboard: tap a chat to open it
+		for _, hit := range m.dashHits {
+			if hit.y == y {
+				return m, m.openJIDByChat(hit.jid)
+			}
+		}
+		return m, nil
+	}
+	if !m.inChat { // wide screen: tapping the chat pane gives it focus
+		m.inChat = true
+		m.input.Focus()
+		return m, textinput.Blink
+	}
+	switch {
+	case y == 0:
+		if m.w < 70 && x <= 4 {
+			return m, m.leaveChat() // the "‹" back arrow
+		}
+	case y == h-1: // tapping the input box returns from message-picking to typing
+		if m.selMsg >= 0 || m.picker || m.confirmDel {
+			m.picker, m.confirmDel = false, false
+			return m, m.exitSelect()
+		}
+	case y == h-2:
+		if m.hasReply || m.editID != "" { // tap the reply / edit bar to cancel it
+			if m.editID != "" {
+				m.input.SetValue("")
+			}
+			m.hasReply = false
+			m.editID = ""
+		}
+	case y >= 1 && y < h-2:
+		if len(m.msgs) == 0 {
+			return m, nil
+		}
+		avail := h - 3
+		lay := m.layoutMsgs(w)
+		scroll := clamp(m.scroll, 0, max(0, len(lay.lines)-avail))
+		end := len(lay.lines) - scroll
+		start := max(0, end-avail)
+		pad := avail - (end - start)
+		line := start + (y - 1 - pad)
+		if line < start || line >= end {
+			return m, nil
+		}
+		for i := range m.msgs {
+			if line >= lay.start[i] && line < lay.end[i] {
+				m.selMsg = i // tap a message to pick it (reply / react / edit …)
+				m.input.Blur()
+				break
+			}
+		}
+	}
+	return m, nil
 }
 
 func (m *tuiModel) pick(rest string) (Message, string, error) {
@@ -975,8 +1566,14 @@ func (m *tuiModel) pick(rest string) (Message, string, error) {
 }
 
 func (m *tuiModel) submit() tea.Cmd {
+	if m.cur == "" {
+		return nil
+	}
 	text := strings.TrimSpace(m.input.Value())
-	if text == "" || m.cur == "" {
+	if m.editID == "" { // pasted lines + the box = one single message
+		text = strings.TrimSpace(strings.Join(append(append([]string{}, m.lines...), m.input.Value()), "\n"))
+	}
+	if text == "" {
 		return nil
 	}
 	chat, be := m.cur, m.be
@@ -990,7 +1587,10 @@ func (m *tuiModel) submit() tea.Cmd {
 		})
 	}
 	m.input.SetValue("")
-	if strings.HasPrefix(text, "/") {
+	multi := len(m.lines) > 0
+	m.lines = nil
+	m.syncDraft() // sent, so the saved draft is gone
+	if !multi && strings.HasPrefix(text, "/") {
 		return m.slash(text)
 	}
 	m.scroll = 0
@@ -1020,6 +1620,12 @@ func (m *tuiModel) slash(text string) tea.Cmd {
 	switch cmd {
 	case "/help", "/?":
 		m.showHelp = true
+	case "/pin":
+		if m.togglePin(chat) {
+			m.status = "★ pinned to the top"
+		} else {
+			m.status = "unpinned"
+		}
 	case "/theme":
 		name := strings.ToLower(strings.TrimSpace(rest))
 		if !applyTheme(name) {
@@ -1109,6 +1715,9 @@ func (m *tuiModel) View() string {
 	if m.showHelp {
 		return m.renderHelp()
 	}
+	if m.showDash {
+		return m.renderDashScreen()
+	}
 	pw := m.paneWidths()
 	lw, rw := pw[0], pw[1]
 	var left, right []string
@@ -1151,13 +1760,23 @@ func (m *tuiModel) renderHelp() string {
 	blank()
 	title("Chat list")
 	line("⏎", "open chat")
-	line("← → 1 2", "Chats / Groups tabs")
+	line("← → 1-4", "Chats Groups Channels Unread")
+	line("u", "unread tab on / off")
+	line("p", "pin / unpin chat ★")
+	line("c  or  n", "contacts · new chat")
+	line("d", "home dashboard")
 	line("j k  ↑ ↓", "move")
-	line("/", "search this tab")
+	line("/", "search chats · contacts · messages")
 	line("q", "quit")
 	blank()
+	title("Touch")
+	line("tap", "open chat · tab · button")
+	line("swipe", "scroll list or messages")
+	line("tap message", "pick it (reply, react…)")
+	blank()
 	title("In a chat")
-	line("⏎", "send message")
+	line("⏎", "send (pasted text = 1 message)")
+	line("drafts", "unsent text is kept per chat")
 	line("↑ (empty box)", "pick a message")
 	line("PgUp PgDn", "scroll · End = latest")
 	line("Esc", "back / cancel reply")
@@ -1171,6 +1790,7 @@ func (m *tuiModel) renderHelp() string {
 	blank()
 	title("Commands")
 	line("/file path", "send a file [caption]")
+	line("/pin", "pin / unpin this chat")
 	line("/theme name", strings.Join(themeNames(), " "))
 	blank()
 	rows = append(rows, bgr(w,
@@ -1188,31 +1808,85 @@ func (m *tuiModel) renderHelp() string {
 	return strings.Join(rows, "\n")
 }
 
-func (m *tuiModel) tabBar(w int) string {
-	segs := []seg{{t: " "}}
-	used := 1
-	for _, k := range m.tabList() {
-		label := " " + tabName(k)
-		if n := m.tabUnread(k); n > 0 {
-			label += fmt.Sprintf(" %d", n)
+type tabPos struct {
+	kind, x0, x1 int
+	label        string
+}
+
+// tabLayout places the tabs; it falls back to shorter names when the pane is narrow.
+func (m *tuiModel) tabLayout(w int) []tabPos {
+	var out []tabPos
+	for mode := 0; mode < 3; mode++ {
+		out = out[:0]
+		used, fits := 1, true
+		for _, k := range m.tabList() {
+			name := tabName(k)
+			if mode >= 1 {
+				name = tabShort(k)
+			}
+			label := " " + name
+			if n := m.tabUnread(k); n > 0 {
+				label += " " + unreadLabel(n)
+			}
+			label += " "
+			lw := runewidth.StringWidth(label)
+			if used+lw > w {
+				fits = false
+				break
+			}
+			out = append(out, tabPos{kind: k, x0: used, x1: used + lw, label: label})
+			used += lw
+			if mode < 2 {
+				used++
+			}
 		}
-		label += " "
-		lw := runewidth.StringWidth(label)
-		if used+lw+1 > w {
+		if fits {
 			break
 		}
-		if k == m.tab {
-			segs = append(segs, seg{t: label, fg: th.bg, bg: th.accent, bold: true})
-		} else {
-			segs = append(segs, seg{t: label, fg: th.dim})
+	}
+	return out
+}
+
+func (m *tuiModel) tabBar(w int) string {
+	segs := []seg{}
+	cur := 0
+	for _, p := range m.tabLayout(w) {
+		if p.x0 > cur {
+			segs = append(segs, seg{t: spaces(p.x0 - cur)})
 		}
-		segs = append(segs, seg{t: " "})
-		used += lw + 1
+		if p.kind == m.tab {
+			segs = append(segs, seg{t: p.label, fg: th.bg, bg: th.accent, bold: true})
+		} else {
+			segs = append(segs, seg{t: p.label, fg: th.dim})
+		}
+		cur = p.x1
 	}
 	return bgr(w, segs...)
 }
 
+const contactsBtnW = 12 // width of the "＋ Contacts" button
+
+// listGeom: how many chat rows fit, and the index of the first one shown.
+func (m *tuiModel) listGeom(h int) (perPage, top int) {
+	perPage = max(1, (h-4)/2) // header + tabs on top, button + hints at the bottom
+	if len(m.shown) > perPage {
+		top = clamp(m.sel-perPage/2, 0, len(m.shown)-perPage)
+	}
+	return
+}
+
+func (m *tuiModel) contactGeom(h int) (perPage, top int) {
+	perPage = max(1, (h-3)/2)
+	if len(m.cshown) > perPage {
+		top = clamp(m.csel-perPage/2, 0, len(m.cshown)-perPage)
+	}
+	return
+}
+
 func (m *tuiModel) renderList(w, h int) []string {
+	if m.contactsMode {
+		return m.renderContacts(w, h)
+	}
 	rows := make([]string, h)
 	for i := range rows {
 		rows[i] = blankRow(w)
@@ -1232,34 +1906,104 @@ func (m *tuiModel) renderList(w, h int) []string {
 			seg{t: " ●", fg: dotFg},
 			seg{t: " wacli", fg: th.text, bold: true})
 	}
+	if m.searching() {
+		return m.renderResults(rows, w, h)
+	}
 	rows[1] = m.tabBar(w)
 
 	if len(m.shown) == 0 {
-		rows[2] = bgr(w, seg{t: trunc(" Nothing here yet", w), fg: th.dim})
-		rows[3] = bgr(w, seg{t: trunc(" New messages show up here", w), fg: th.dim})
+		t1, t2 := " Nothing here yet", " New messages show up here"
+		if m.tab == 3 {
+			t1, t2 = " No unread chats 🎉", " You're all caught up"
+		}
+		rows[2] = bgr(w, seg{t: trunc(t1, w), fg: th.dim})
+		rows[3] = bgr(w, seg{t: trunc(t2, w), fg: th.dim})
 	}
-	perPage := max(1, (h-3)/2)
-	top := 0
-	if len(m.shown) > perPage {
-		top = clamp(m.sel-perPage/2, 0, len(m.shown)-perPage)
-	}
+	perPage, top := m.listGeom(h)
 	for i := 0; i < perPage; i++ {
 		idx := top + i
 		if idx >= len(m.shown) {
 			break
 		}
 		r := 2 + i*2
-		if r+1 >= h-1 {
+		if r+1 >= h-2 {
 			break
 		}
 		rows[r], rows[r+1] = m.listItem(m.shown[idx], idx == m.sel, w)
 	}
+	// WhatsApp-style "new chat" button, bottom left
+	rows[h-2] = bgr(w, seg{t: " "}, seg{t: " + Contacts ", fg: th.bg, bg: th.accent, bold: true})
 	if m.inChat {
 		rows[h-1] = hintRow(w, "Tab", "back to list")
 	} else {
-		rows[h-1] = hintRow(w, "⏎", "open", "←→", "tabs", "/", "find", "?", "help", "q", "quit")
+		rows[h-1] = hintRow(w, "⏎", "open", "c", "contacts", "p", "pin", "←→", "tabs", "u", "unread", "/", "find", "?", "help", "q", "quit")
 	}
 	return rows
+}
+
+func (m *tuiModel) renderContacts(w, h int) []string {
+	rows := make([]string, h)
+	for i := range rows {
+		rows[i] = blankRow(w)
+	}
+	v := m.cfilter.View()
+	if pad := w - lipgloss.Width(v); pad > 0 {
+		v += blankRow(pad)
+	}
+	rows[0] = v
+	title := " ‹ Contacts"
+	if n := len(m.contacts); n > 0 {
+		title += fmt.Sprintf("  %d", n)
+	}
+	rows[1] = render(th.bar, w, seg{t: trunc(title, w), fg: th.accent, bold: true})
+
+	if len(m.cshown) == 0 {
+		msg := " Loading contacts…"
+		if len(m.contacts) > 0 || strings.TrimSpace(m.cfilter.Value()) != "" {
+			msg = " No match — type a full number to message it"
+		}
+		rows[2] = bgr(w, seg{t: trunc(msg, w), fg: th.dim})
+	}
+	perPage, top := m.contactGeom(h)
+	for i := 0; i < perPage; i++ {
+		idx := top + i
+		if idx >= len(m.cshown) {
+			break
+		}
+		r := 2 + i*2
+		if r+1 >= h {
+			break
+		}
+		rows[r], rows[r+1] = m.contactItem(m.cshown[idx], idx == m.csel, w)
+	}
+	rows[h-1] = hintRow(w, "⏎", "chat", "Esc", "back")
+	return rows
+}
+
+func (m *tuiModel) contactItem(c Contact, selected bool, w int) (string, string) {
+	bg := th.bg
+	if selected {
+		bg = th.sel
+	}
+	name := clean(contactTitle(c))
+	av := runewidth.FillRight(runewidth.Truncate(initials(strings.TrimPrefix(name, "+")), 2, ""), 2)
+	l1 := render(bg, w,
+		seg{t: " "},
+		seg{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(c.JID, len(avatarBgs))], bold: true},
+		seg{t: " "},
+		seg{t: trunc(name, max(1, w-5)), fg: th.text, bold: true},
+	)
+	sub := ""
+	if strings.TrimSpace(c.Name) != "" && c.Phone != "" {
+		sub = "+" + c.Phone
+	} else if strings.TrimSpace(c.Name) == "" {
+		sub = "Message this number"
+	}
+	l2 := render(bg, w,
+		seg{t: "    "},
+		seg{t: trunc(sub, max(1, w-5)), fg: th.dim},
+	)
+	return l1, l2
 }
 
 func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
@@ -1275,13 +2019,18 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 	if c.Unread > 0 {
 		tmFg = th.accent
 	}
-	nm := trunc(name, max(1, w-5-tmW-1))
-	gap := max(1, w-4-runewidth.StringWidth(nm)-tmW-1)
+	starW, star := 0, ""
+	if m.pinned[c.JID] {
+		starW, star = 2, " ★"
+	}
+	nm := trunc(name, max(1, w-5-tmW-1-starW))
+	gap := max(1, w-4-runewidth.StringWidth(nm)-starW-tmW-1)
 	l1 := render(bg, w,
 		seg{t: " "},
 		seg{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(c.JID, len(avatarBgs))], bold: true},
 		seg{t: " "},
 		seg{t: nm, fg: nameFg, bold: c.Unread > 0},
+		seg{t: star, fg: warnColor},
 		seg{t: spaces(gap)},
 		seg{t: tm, fg: tmFg},
 	)
@@ -1293,11 +2042,22 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 		badge = fmt.Sprintf(" %d ", c.Unread)
 	}
 	bw := runewidth.StringWidth(badge)
-	pv := trunc(strings.ReplaceAll(clean(prettyPreview(c.LastText)), "\n", " "), max(1, w-4-bw-1))
-	gap2 := max(0, w-4-runewidth.StringWidth(pv)-bw-1)
+	pvText := strings.ReplaceAll(clean(prettyPreview(c.LastText)), "\n", " ")
+	pvFg, pvItal := th.dim, false
+	draftPfx := ""
+	if until, ok := m.typingIn[c.JID]; ok && time.Now().Before(until) {
+		pvText, pvFg, pvItal = "typing…", th.accent, true // live typing indicator
+	} else if d := m.draftFor(c.JID); d != "" {
+		draftPfx = "Draft: " // unsent text, in red
+		pvText = strings.ReplaceAll(clean(d), "\n", " ")
+	}
+	pfxW := runewidth.StringWidth(draftPfx)
+	pv := trunc(pvText, max(1, w-4-bw-1-pfxW))
+	gap2 := max(0, w-4-pfxW-runewidth.StringWidth(pv)-bw-1)
 	l2 := render(bg, w,
 		seg{t: "    "},
-		seg{t: pv, fg: th.dim},
+		seg{t: draftPfx, fg: draftColor},
+		seg{t: pv, fg: pvFg, ital: pvItal},
 		seg{t: spaces(gap2)},
 		seg{t: badge, fg: th.bg, bg: th.accent, bold: true},
 	)
@@ -1376,6 +2136,8 @@ func (m *tuiModel) contextRow(w int) string {
 			fg = warnColor
 		}
 		return one(fg, m.status)
+	case len(m.lines) > 0 && m.selMsg < 0:
+		return one(th.accent, fmt.Sprintf("📋 %d lines pasted · sends as ONE message · Enter sends · ⌫ edits", len(m.lines)+1))
 	case m.selMsg >= 0:
 		return hintRow(w, "r", "reply", "e", "edit", "d", "del", "g", "save", "+", "react", "Esc", "back")
 	case m.scroll > 0:
@@ -1393,7 +2155,11 @@ func (m *tuiModel) renderChat(w, h int) []string {
 	avail := h - 3
 
 	if m.cur == "" {
-		rows[1] = bgr(w, seg{t: trunc(" Pick a chat from the list", w), fg: th.dim})
+		for i, l := range m.dashLines(w) {
+			if 1+i < h-1 {
+				rows[1+i] = l
+			}
+		}
 	} else if len(m.msgs) == 0 {
 		rows[avail/2+1] = bgr(w, seg{t: trunc("   No messages yet — say hi 👋", w), fg: th.dim})
 	} else {
@@ -1610,4 +2376,392 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID ma
 		out = append(out, render(th.bg, w, segs...))
 	}
 	return out
+}
+
+// ================================================================ home dashboard
+
+type dashHit struct {
+	y   int // pane row
+	jid string
+}
+
+// dashLines draws the short home dashboard (ASCII logo, status, unread, top 3).
+// Rows are meant to start at pane row 1; tappable rows are recorded in m.dashHits.
+func (m *tuiModel) dashLines(w int) []string {
+	m.dashHits = m.dashHits[:0]
+	var rows []string
+	add := func(segs ...seg) { rows = append(rows, bgr(w, segs...)) }
+	blank := func() { rows = append(rows, blankRow(w)) }
+	text := func(fg lipgloss.Color, bold bool, t string) {
+		add(seg{t: " " + trunc(t, max(1, w-2)), fg: fg, bold: bold})
+	}
+
+	blank()
+	for _, l := range []string{"╦ ╦╔═╗╔═╗╦  ╦", "║║║╠═╣║  ║  ║", "╚╩╝╩ ╩╚═╝╩═╝╩"} {
+		text(th.accent, true, "  "+l)
+	}
+	text(th.dim, false, "  WhatsApp from your terminal")
+	blank()
+
+	dot, state := lipgloss.Color("#F15C6D"), "offline"
+	if m.online {
+		dot, state = th.accent, "connected"
+	}
+	mode := "direct"
+	if m.st.Mode == "daemon" {
+		mode = "daemon"
+	}
+	add(seg{t: " ● ", fg: dot}, seg{t: trunc(state+" · "+mode, max(1, w-4)), fg: th.text})
+
+	who := strings.TrimSpace(m.st.PushName)
+	if m.st.Phone != "" {
+		if who != "" {
+			who += " · "
+		}
+		who += "+" + m.st.Phone
+	}
+	if who != "" {
+		text(th.dim, false, "   "+who)
+	}
+	blank()
+
+	un := m.unreadChats()
+	total := 0
+	for _, c := range un {
+		total += c.Unread
+	}
+	if total == 0 {
+		text(th.accent, false, "✓ all caught up")
+	} else {
+		text(th.text, true, fmt.Sprintf("✉ %d unread · %d chats", total, len(un)))
+		for i, c := range un {
+			if i == 3 {
+				break
+			}
+			badge := " " + unreadLabel(c.Unread) + " "
+			bw := runewidth.StringWidth(badge)
+			nm := trunc(clean(c.Title()), max(1, w-6-bw))
+			gap := max(1, w-4-runewidth.StringWidth(nm)-bw-1)
+			m.dashHits = append(m.dashHits, dashHit{y: 1 + len(rows), jid: c.JID})
+			add(
+				seg{t: "  ▸ ", fg: th.accent},
+				seg{t: nm, fg: th.text},
+				seg{t: spaces(gap)},
+				seg{t: badge, fg: th.bg, bg: th.accent, bold: true},
+			)
+		}
+	}
+	blank()
+	text(th.dim, false, "c contacts · u unread · ? help")
+	return rows
+}
+
+// renderDashScreen is the full-screen dashboard (phones: tap the "● wacli" bar or press d).
+func (m *tuiModel) renderDashScreen() string {
+	w := m.w
+	rows := []string{render(th.bar, w,
+		seg{t: " ● wacli", fg: th.accent, bold: true},
+		seg{t: " — home", fg: th.text, bold: true})}
+	rows = append(rows, m.dashLines(w)...)
+	for len(rows) < m.h-1 {
+		rows = append(rows, blankRow(w))
+	}
+	if len(rows) > m.h-1 {
+		rows = rows[:m.h-1]
+	}
+	rows = append(rows, bgr(w, seg{t: " tap or press any key to close", fg: th.dim, ital: true}))
+	return strings.Join(rows, "\n")
+}
+
+// ================================================================ drafts
+
+// draftText is what is currently typed in the open chat (multi-line paste included).
+func (m *tuiModel) draftText() string {
+	if m.editID != "" {
+		return ""
+	}
+	t := strings.Join(append(append([]string{}, m.lines...), m.input.Value()), "\n")
+	if strings.TrimSpace(t) == "" || (len(m.lines) == 0 && strings.HasPrefix(t, "/")) {
+		return ""
+	}
+	return t
+}
+
+// draftFor is the unsent text of any chat (live text for the chat that is open).
+func (m *tuiModel) draftFor(jid string) string {
+	if jid == m.cur {
+		return m.draftText()
+	}
+	return m.drafts[jid]
+}
+
+// syncDraft stores the open chat's unsent text in drafts.json (only when it changed).
+func (m *tuiModel) syncDraft() {
+	if m.cur == "" {
+		return
+	}
+	t := m.draftText()
+	old, had := m.drafts[m.cur]
+	switch {
+	case t == "" && !had:
+		return
+	case t == "":
+		delete(m.drafts, m.cur)
+	case t == old:
+		return
+	default:
+		m.drafts[m.cur] = t
+	}
+	_ = saveDrafts(m.drafts)
+}
+
+func (m *tuiModel) setDraft(d string) {
+	parts := strings.Split(d, "\n")
+	m.lines = append([]string{}, parts[:len(parts)-1]...)
+	m.input.SetValue(parts[len(parts)-1])
+	m.input.CursorEnd()
+}
+
+// onPaste keeps a multi-line paste as ONE message: the finished lines go to m.lines and
+// the last, unfinished line stays in the input box. Nothing is sent until Enter is pressed.
+func (m *tuiModel) onPaste(k tea.KeyMsg) bool {
+	text := strings.ReplaceAll(string(k.Runes), "\r\n", "\n")
+	text = strings.ReplaceAll(text, "\r", "\n")
+	text = strings.ReplaceAll(text, "\t", "  ")
+	if !strings.Contains(text, "\n") {
+		return false // single line: the input box handles it
+	}
+	parts := strings.Split(text, "\n")
+	m.lines = append(m.lines, m.input.Value()+parts[0])
+	m.lines = append(m.lines, parts[1:len(parts)-1]...)
+	m.input.SetValue(parts[len(parts)-1])
+	m.input.CursorEnd()
+	return true
+}
+
+// ================================================================ global search
+
+func (m *tuiModel) searching() bool {
+	return m.filtering && strings.TrimSpace(m.filter.Value()) != ""
+}
+
+func (m *tuiModel) chatTitle(jid string) string {
+	for _, c := range m.chats {
+		if c.JID == jid {
+			return c.Title()
+		}
+	}
+	for _, c := range m.contacts {
+		if c.JID == jid {
+			return contactTitle(c)
+		}
+	}
+	return userPart(jid)
+}
+
+// snippet shortens a message around the first match so the match stays visible.
+func snippet(text, q string) string {
+	text = strings.Join(strings.Fields(clean(text)), " ")
+	lt := strings.ToLower(text)
+	if i := strings.Index(lt, strings.ToLower(q)); i > 0 {
+		if at := len([]rune(lt[:i])); at > 24 {
+			if r := []rune(text); at-15 < len(r) {
+				return "…" + string(r[at-15:])
+			}
+		}
+	}
+	return text
+}
+
+// runSearch rebuilds the results right away and asks the backend for message hits.
+func (m *tuiModel) runSearch() tea.Cmd {
+	q := strings.TrimSpace(m.filter.Value())
+	m.rebuildResults()
+	if len([]rune(q)) < 2 {
+		m.hits = nil
+		return nil
+	}
+	be := m.be
+	return func() tea.Msg {
+		hits, err := be.Search(SearchArgs{Query: q, Limit: 30})
+		if err != nil { // e.g. an older daemon without search: chats + contacts still work
+			return searchMsg{q: q}
+		}
+		return searchMsg{q: q, hits: hits}
+	}
+}
+
+// rebuildResults: a typed number first, then chats, contacts without history, then messages.
+func (m *tuiModel) rebuildResults() {
+	q := strings.TrimSpace(m.filter.Value())
+	if q == "" {
+		m.res, m.rsel = nil, 0
+		return
+	}
+	qd := digitsOnly(q)
+	type scored struct {
+		r searchRes
+		s int
+	}
+	inChats := map[string]bool{}
+	var chats, contacts []scored
+	for _, c := range m.chats {
+		if chatKind(c.JID) < 0 {
+			continue
+		}
+		inChats[c.JID] = true
+		sc := fuzzyScore(q, c.Title())
+		if sc == 0 && len(qd) >= 3 && strings.Contains(userPart(c.JID), qd) {
+			sc = 50
+		}
+		if sc == 0 {
+			continue
+		}
+		sub := strings.ReplaceAll(clean(prettyPreview(c.LastText)), "\n", " ")
+		chats = append(chats, scored{searchRes{kind: 0, jid: c.JID, title: c.Title(), sub: sub, ts: c.LastTS}, sc})
+	}
+	byScore := func(l []scored) {
+		sort.SliceStable(l, func(i, j int) bool { return l[i].s > l[j].s })
+	}
+	byScore(chats)
+	numberKnown := false
+	for _, c := range m.contacts {
+		if c.Phone != "" && c.Phone == qd {
+			numberKnown = true
+		}
+		if inChats[c.JID] {
+			continue
+		}
+		sc := fuzzyScore(q, c.Name)
+		if sc == 0 && len(qd) >= 3 && strings.Contains(c.Phone, qd) {
+			sc = 50
+		}
+		if sc == 0 {
+			continue
+		}
+		sub := ""
+		if c.Phone != "" {
+			sub = "+" + c.Phone
+		}
+		contacts = append(contacts, scored{searchRes{kind: 1, jid: c.JID, title: contactTitle(c), sub: sub}, sc})
+	}
+	byScore(contacts)
+
+	out := make([]searchRes, 0, len(chats)+len(contacts)+len(m.hits)+1)
+	if isPhoneLike(q) && !numberKnown && !inChats[qd+"@s.whatsapp.net"] {
+		out = append(out, searchRes{kind: 1, jid: qd + "@s.whatsapp.net", title: "+" + qd, sub: "Message this number"})
+	}
+	for _, c := range chats {
+		out = append(out, c.r)
+	}
+	for i, c := range contacts {
+		if i == 30 {
+			break
+		}
+		out = append(out, c.r)
+	}
+	lq := strings.ToLower(q)
+	n := 0
+	for _, h := range m.hits {
+		if n == 30 {
+			break
+		}
+		if chatKind(h.Chat) < 0 || !strings.Contains(strings.ToLower(h.Text), lq) {
+			continue
+		}
+		who := "You"
+		if !h.FromMe {
+			who = userPart(h.Sender)
+		}
+		out = append(out, searchRes{kind: 2, jid: h.Chat, title: m.chatTitle(h.Chat),
+			sub: who + ": " + snippet(h.Text, q), ts: h.TS, msgID: h.ID})
+		n++
+	}
+	m.res = out
+	m.rsel = clamp(m.rsel, 0, max(0, len(out)-1))
+}
+
+func (m *tuiModel) moveRes(d int) {
+	if len(m.res) == 0 {
+		return
+	}
+	m.rsel = clamp(m.rsel+d, 0, len(m.res)-1)
+}
+
+func (m *tuiModel) resGeom(h int) (perPage, top int) {
+	perPage = max(1, (h-4)/2)
+	if len(m.res) > perPage {
+		top = clamp(m.rsel-perPage/2, 0, len(m.res)-perPage)
+	}
+	return
+}
+
+func (m *tuiModel) openRes() tea.Cmd {
+	if m.rsel < 0 || m.rsel >= len(m.res) {
+		return nil
+	}
+	r := m.res[m.rsel]
+	cmd := m.openJID(r.jid, r.title)
+	if r.kind == 2 {
+		m.jumpID = r.msgID
+	}
+	return cmd
+}
+
+func (m *tuiModel) renderResults(rows []string, w, h int) []string {
+	rows[1] = render(th.bar, w, seg{t: trunc(fmt.Sprintf(" Results  %d", len(m.res)), w), fg: th.accent, bold: true})
+	if len(m.res) == 0 {
+		rows[2] = bgr(w, seg{t: trunc(" No matches", w), fg: th.dim})
+		rows[3] = bgr(w, seg{t: trunc(" Try a name, a number or a word", w), fg: th.dim})
+	}
+	perPage, top := m.resGeom(h)
+	for i := 0; i < perPage; i++ {
+		idx := top + i
+		if idx >= len(m.res) {
+			break
+		}
+		r := 2 + i*2
+		if r+1 >= h-2 {
+			break
+		}
+		rows[r], rows[r+1] = m.resItem(m.res[idx], idx == m.rsel, w)
+	}
+	rows[h-2] = bgr(w, seg{t: " "}, seg{t: " + Contacts ", fg: th.bg, bg: th.accent, bold: true})
+	rows[h-1] = hintRow(w, "⏎", "open", "Esc", "clear")
+	return rows
+}
+
+func (m *tuiModel) resItem(r searchRes, selected bool, w int) (string, string) {
+	bg := th.bg
+	if selected {
+		bg = th.sel
+	}
+	name := clean(r.title)
+	av := runewidth.FillRight(runewidth.Truncate(initials(strings.TrimPrefix(name, "+")), 2, ""), 2)
+	tm := listTime(r.ts)
+	if r.kind == 1 {
+		tm = "contact"
+	}
+	tmW := runewidth.StringWidth(tm)
+	nm := trunc(name, max(1, w-5-tmW-1))
+	gap := max(1, w-4-runewidth.StringWidth(nm)-tmW-1)
+	l1 := render(bg, w,
+		seg{t: " "},
+		seg{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(r.jid, len(avatarBgs))], bold: true},
+		seg{t: " "},
+		seg{t: nm, fg: th.text, bold: true},
+		seg{t: spaces(gap)},
+		seg{t: tm, fg: th.dim},
+	)
+	prefix := ""
+	if r.kind == 2 {
+		prefix = "↳ "
+	}
+	sub := strings.ReplaceAll(clean(r.sub), "\n", " ")
+	l2 := render(bg, w,
+		seg{t: "    "},
+		seg{t: prefix, fg: th.accent},
+		seg{t: trunc(sub, max(1, w-5-runewidth.StringWidth(prefix))), fg: th.dim},
+	)
+	return l1, l2
 }

@@ -13,6 +13,7 @@ type Config struct {
 	DownloadDir   string            `json:"download_dir"`
 	Theme         string            `json:"theme"`
 	Aliases       map[string]string `json:"aliases"`
+	Pinned        []string          `json:"pinned"` // chat JIDs pinned (★) to the top of the TUI list
 }
 
 func homeDir() string {
@@ -68,4 +69,35 @@ func (c *Config) Save() error {
 		return err
 	}
 	return os.WriteFile(configPath(), b, 0o600)
+}
+
+// ---------------------------------------------------------------- drafts
+
+// Unsent text per chat, kept in ~/.wacli/drafts.json so it survives closing the TUI.
+func draftsPath() string { return filepath.Join(dataDir(), "drafts.json") }
+
+func loadDrafts() map[string]string {
+	out := map[string]string{}
+	if b, err := os.ReadFile(draftsPath()); err == nil {
+		_ = json.Unmarshal(b, &out)
+	}
+	if out == nil {
+		out = map[string]string{}
+	}
+	return out
+}
+
+func saveDrafts(d map[string]string) error {
+	if len(d) == 0 {
+		_ = os.Remove(draftsPath())
+		return nil
+	}
+	if err := os.MkdirAll(dataDir(), 0o700); err != nil {
+		return err
+	}
+	b, err := json.Marshal(d)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(draftsPath(), b, 0o600)
 }

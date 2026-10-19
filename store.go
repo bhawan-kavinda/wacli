@@ -187,6 +187,31 @@ func (s *Store) messages(chat string, limit int) ([]Message, error) {
 	return out, nil
 }
 
+// search finds messages whose text contains q (case-insensitive for ASCII), newest first.
+func (s *Store) search(q string, limit int) ([]SearchHit, error) {
+	esc := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`).Replace(q)
+	rows, err := s.db.Query(`SELECT m.chat, m.id, m.ts, m.from_me,
+		COALESCE(NULLIF(n.name,''), NULLIF(m.sender_name,''), m.sender), m.text
+		FROM wacli_messages m LEFT JOIN wacli_names n ON n.jid = m.sender
+		WHERE m.deleted = 0 AND m.text != '' AND m.text LIKE ? ESCAPE '\'
+		ORDER BY m.ts DESC LIMIT ?`, "%"+esc+"%", limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []SearchHit{}
+	for rows.Next() {
+		var h SearchHit
+		var fm int
+		if err := rows.Scan(&h.Chat, &h.ID, &h.TS, &fm, &h.Sender, &h.Text); err != nil {
+			return nil, err
+		}
+		h.FromMe = fm == 1
+		out = append(out, h)
+	}
+	return out, rows.Err()
+}
+
 // getMessage finds a message by full id or id prefix.
 func (s *Store) getMessage(chat, id string) (*Message, []byte, error) {
 	var m Message

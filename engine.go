@@ -497,6 +497,17 @@ func (e *Engine) Messages(q MsgQuery) ([]Message, error) {
 	return e.st.messages(jid, q.Limit)
 }
 
+func (e *Engine) Search(a SearchArgs) ([]SearchHit, error) {
+	q := strings.TrimSpace(a.Query)
+	if len([]rune(q)) < 2 {
+		return []SearchHit{}, nil
+	}
+	if a.Limit <= 0 || a.Limit > 200 {
+		a.Limit = 30
+	}
+	return e.st.search(q, a.Limit)
+}
+
 func (e *Engine) Contacts() ([]Contact, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()

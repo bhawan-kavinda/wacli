@@ -113,6 +113,21 @@ type EditArgs struct {
 	Text string `json:"text"`
 }
 
+// SearchArgs / SearchHit: full-text search over stored messages.
+type SearchArgs struct {
+	Query string `json:"query"`
+	Limit int    `json:"limit"`
+}
+
+type SearchHit struct {
+	Chat   string `json:"chat"`
+	ID     string `json:"id"`
+	Sender string `json:"sender"` // display name, or the sender's JID if no name is known
+	FromMe bool   `json:"from_me"`
+	TS     int64  `json:"ts"`
+	Text   string `json:"text"`
+}
+
 type MsgRef struct {
 	Chat string `json:"chat"`
 	ID   string `json:"id"`
@@ -139,6 +154,7 @@ type Backend interface {
 	Status() (Status, error)
 	Chats() ([]Chat, error)
 	Messages(MsgQuery) ([]Message, error)
+	Search(SearchArgs) ([]SearchHit, error)
 	Contacts() ([]Contact, error)
 	Groups() ([]Group, error)
 	Resolve(string) (string, error)
