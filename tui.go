@@ -414,6 +414,11 @@ type tuiModel struct {
 	ffilter   textinput.Model
 	fTarget   Chat
 
+	// swipe on the chat list: the press is remembered and decided on release
+	// (a short move = tap, a wide horizontal move = switch tab)
+	pressing       bool
+	pressX, pressY int
+
 	status string
 	events <-chan Event
 	cancel func()
@@ -1399,7 +1404,45 @@ func (m *tuiModel) paneSplit() (lw, rw, rx0 int) {
 	return
 }
 
+// tabSwipeOK: the plain chat list accepts swipes (and so decides a tap on release).
+func (m *tuiModel) tabSwipeOK() bool { return !m.contactsMode && !m.searching() }
+
+const swipeCols = 5 // a horizontal drag this wide (in cells) switches the tab
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// onMouseRelease finishes a touch that started on the chat list:
+// a wide horizontal drag switches the tab, a short press is a tap.
+func (m *tuiModel) onMouseRelease(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if !m.pressing {
+		return m, nil
+	}
+	m.pressing = false
+	dx, dy := msg.X-m.pressX, msg.Y-m.pressY
+	if absInt(dx) >= swipeCols && absInt(dx) >= 2*absInt(dy) {
+		if dx < 0 {
+			m.switchTab(1) // finger moved left -> next tab
+		} else {
+			m.switchTab(-1) // finger moved right -> previous tab
+		}
+		return m, nil
+	}
+	if absInt(dy) >= 3 && absInt(dy) > absInt(dx) {
+		return m, nil // a vertical drag is not a tap
+	}
+	lw, _, _ := m.paneSplit()
+	return m.clickLeft(m.pressX, m.pressY, lw)
+}
+
 func (m *tuiModel) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action == tea.MouseActionRelease {
+		return m.onMouseRelease(msg)
+	}
 	if msg.Action != tea.MouseActionPress {
 		return m, nil
 	}
@@ -1425,6 +1468,15 @@ func (m *tuiModel) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	inLeft := lw > 0 && msg.X < lw
 	inRight := rw > 0 && msg.X >= rx0
 	switch msg.Button {
+	case tea.MouseButtonWheelLeft, tea.MouseButtonWheelRight:
+		if inLeft && m.tabSwipeOK() { // terminals that report a sideways swipe as a wheel
+			if msg.Button == tea.MouseButtonWheelLeft {
+				m.switchTab(-1)
+			} else {
+				m.switchTab(1)
+			}
+		}
+		return m, nil
 	case tea.MouseButtonWheelUp, tea.MouseButtonWheelDown:
 		d := 1
 		if msg.Button == tea.MouseButtonWheelUp {
@@ -1449,6 +1501,10 @@ func (m *tuiModel) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.MouseButtonLeft:
 		if inLeft {
+			if m.tabSwipeOK() {
+				m.pressing, m.pressX, m.pressY = true, msg.X, msg.Y
+				return m, nil // tap or swipe is decided on release
+			}
 			return m.clickLeft(msg.X, msg.Y, lw)
 		}
 		if inRight {
@@ -1485,14 +1541,11 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 	}
 	if m.searching() {
 		switch {
-		case y == h-2:
-			if x < contactsBtnW+2 {
-				return m, m.openContacts()
-			}
-			if x >= filesBtnX && x < filesBtnX+filesBtnW {
-				return m, m.openFiles()
-			}
-		case y >= 2 && y < h-2:
+		case fabHit(x, y, w, h-1) == fabContacts:
+			return m, m.openContacts()
+		case fabHit(x, y, w, h-1) == fabFiles:
+			return m, m.openFiles()
+		case y >= 2 && y < h-1:
 			perPage, top := m.resGeom(h)
 			slot := (y - 2) / 2
 			if slot < perPage && top+slot < len(m.res) {
@@ -1503,24 +1556,21 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch {
+	case fabHit(x, y, w, h-navRows) == fabContacts:
+		return m, m.openContacts()
+	case fabHit(x, y, w, h-navRows) == fabFiles:
+		return m, m.openFiles()
 	case y == 0 && !m.filtering:
-		m.showDash = true // tap the "● wacli" bar for the home dashboard
-	case y == 1:
-		for _, p := range m.tabLayout(w) {
+		m.showDash = true // tap the "WhatsApp" bar for the home dashboard
+	case y >= h-navRows: // bottom tab bar
+		for _, p := range m.navCells(w) {
 			if x >= p.x0 && x < p.x1 {
 				m.setTab(p.kind)
 			}
 		}
-	case y == h-2:
-		if x < contactsBtnW+2 {
-			return m, m.openContacts()
-		}
-		if x >= filesBtnX && x < filesBtnX+filesBtnW {
-			return m, m.openFiles()
-		}
-	case y >= 2 && y < h-2:
+	case y >= 1 && y < h-navRows:
 		perPage, top := m.listGeom(h)
-		slot := (y - 2) / 2
+		slot := (y - 1) / 2
 		if slot < perPage && top+slot < len(m.shown) {
 			m.sel = top + slot
 			m.selJID = m.shown[m.sel].JID
@@ -1811,7 +1861,8 @@ func (m *tuiModel) renderHelp() string {
 	title("Touch")
 	line("tap", "open chat · tab · button")
 	line("tap 📁", "browse files · open or send")
-	line("swipe", "scroll list or messages")
+	line("swipe ↕", "scroll list or messages")
+	line("swipe ← →", "next / previous tab (chat list)")
 	line("tap message", "pick it (reply, react…)")
 	blank()
 	title("In a chat")
@@ -1904,11 +1955,151 @@ func (m *tuiModel) tabBar(w int) string {
 	return bgr(w, segs...)
 }
 
-const contactsBtnW = 12 // width of the "＋ Contacts" button
+const navRows = 2 // height of the bottom tab bar: icon row + label row
+
+func tabIcon(k int) string { return [...]string{"💬", "👥", "📢", "🔔"}[k] }
+
+// navCells splits the bottom tab bar into one equal-width cell per tab.
+func (m *tuiModel) navCells(w int) []tabPos {
+	list := m.tabList()
+	n := len(list)
+	out := make([]tabPos, 0, n)
+	for i, k := range list {
+		out = append(out, tabPos{kind: k, x0: i * w / n, x1: (i + 1) * w / n})
+	}
+	return out
+}
+
+// navBar draws the WhatsApp-style bottom tab bar: an icon row (the active tab sits on a
+// green pill, unread count as a badge) and a label row below it.
+func (m *tuiModel) navBar(w int) (string, string) {
+	var icons, labels []seg
+	for _, p := range m.navCells(w) {
+		cw := p.x1 - p.x0
+		active := p.kind == m.tab
+
+		pill := seg{t: " " + tabIcon(p.kind) + " ", fg: th.text}
+		if active {
+			pill.bg = th.me
+		}
+		badge := seg{}
+		if n := m.tabUnread(p.kind); n > 0 {
+			badge = seg{t: " " + unreadLabel(n) + " ", fg: th.bg, bg: th.accent, bold: true}
+		}
+		tw := segsWidth([]seg{pill, badge})
+		if tw > cw { // too narrow for the badge
+			badge = seg{}
+			tw = segsWidth([]seg{pill})
+		}
+		left := max(0, (cw-tw)/2)
+		icons = append(icons, seg{t: spaces(left)}, pill, badge, seg{t: spaces(max(0, cw-tw-left))})
+
+		name := tabName(p.kind)
+		if runewidth.StringWidth(name)+1 > cw {
+			name = tabShort(p.kind)
+		}
+		name = trunc(name, cw)
+		nw := runewidth.StringWidth(name)
+		pad := max(0, (cw-nw)/2)
+		lab := seg{t: name, fg: th.dim}
+		if active {
+			lab = seg{t: name, fg: th.text, bold: true}
+		}
+		labels = append(labels, seg{t: spaces(pad)}, lab, seg{t: spaces(max(0, cw-nw-pad))})
+	}
+	return render(th.bar, w, icons...), render(th.bar, w, labels...)
+}
+
+// ---- floating action buttons (WhatsApp style): two thick buttons stacked at the bottom
+// right of the chat list - "Files" on top, "Contacts" (the main one) underneath.
+const (
+	fabW     = 14 // button width
+	fabH     = 3  // button height (rows) - thick, easy to tap
+	fabGap   = 1  // empty rows between the two buttons
+	fabPad   = 1  // empty column on each side of a button
+	fabAreaW = fabW + 2*fabPad
+	fabTotal = 2*fabH + fabGap
+)
+
+const (
+	fabNone = iota
+	fabContacts
+	fabFiles
+)
+
+// fabOK: is there room for the buttons? bottom = first row below the button stack.
+func fabOK(w, bottom int) bool { return w >= 28 && bottom-fabTotal >= 4 }
+
+func fabTop(bottom int) int { return bottom - fabTotal }
+
+// fabHit tells which button (if any) a tap at x,y landed on.
+func fabHit(x, y, w, bottom int) int {
+	if !fabOK(w, bottom) || x < w-fabAreaW || x >= w {
+		return fabNone
+	}
+	top := fabTop(bottom)
+	switch {
+	case y >= top && y < top+fabH:
+		return fabFiles
+	case y >= bottom-fabH && y < bottom:
+		return fabContacts
+	}
+	return fabNone
+}
+
+// fabLine draws one row (0..fabH-1) of a button, padded to fabAreaW columns.
+func fabLine(kind, row int) string {
+	fg, bg, label := th.bg, th.accent, "+ Contacts"
+	if kind == fabFiles {
+		fg, bg, label = th.text, th.sel, "📁 Files"
+	}
+	var body []seg
+	if row == fabH/2 {
+		lw := runewidth.StringWidth(label)
+		l := max(0, (fabW-lw)/2)
+		body = []seg{
+			{t: spaces(l), bg: bg},
+			{t: label, fg: fg, bg: bg, bold: true},
+			{t: spaces(max(0, fabW-l-lw)), bg: bg},
+		}
+	} else {
+		body = []seg{{t: spaces(fabW), bg: bg}}
+	}
+	segs := append([]seg{{t: spaces(fabPad)}}, body...)
+	segs = append(segs, seg{t: spaces(fabPad)})
+	return render(th.bg, fabAreaW, segs...)
+}
+
+// fabRowW is the width a list row may use: rows beside the buttons are narrower.
+func fabRowW(w, r, bottom int) int {
+	if fabOK(w, bottom) && r >= fabTop(bottom) && r < bottom {
+		return w - fabAreaW
+	}
+	return w
+}
+
+// overlayFabs appends the button column to the (already narrowed) rows beside it.
+func overlayFabs(rows []string, w, bottom int) {
+	if !fabOK(w, bottom) {
+		return
+	}
+	top := fabTop(bottom)
+	for r := top; r < bottom; r++ {
+		k := r - top
+		switch {
+		case k < fabH:
+			rows[r] += fabLine(fabFiles, k)
+		case k >= fabH+fabGap:
+			rows[r] += fabLine(fabContacts, k-fabH-fabGap)
+		default:
+			rows[r] += blankRow(fabAreaW)
+		}
+	}
+}
 
 // listGeom: how many chat rows fit, and the index of the first one shown.
 func (m *tuiModel) listGeom(h int) (perPage, top int) {
-	perPage = max(1, (h-4)/2) // header + tabs on top, button + hints at the bottom
+	perPage = max(1, (h-1-navRows)/2) // header on top, tab bar at the bottom (buttons float over the list)
 	if len(m.shown) > perPage {
 		top = clamp(m.sel-perPage/2, 0, len(m.shown)-perPage)
 	}
@@ -1929,7 +2120,7 @@ func (m *tuiModel) renderList(w, h int) []string {
 	}
 	rows := make([]string, h)
 	for i := range rows {
-		rows[i] = blankRow(w)
+		rows[i] = blankRow(fabRowW(w, i, h-navRows))
 	}
 	dotFg := lipgloss.Color("#F15C6D")
 	if m.online {
@@ -1944,20 +2135,20 @@ func (m *tuiModel) renderList(w, h int) []string {
 	} else {
 		rows[0] = render(th.bar, w,
 			seg{t: " ●", fg: dotFg},
-			seg{t: " wacli", fg: th.text, bold: true})
+			seg{t: " WhatsApp", fg: th.text, bold: true},
+			seg{t: spaces(max(1, w-13))},
+			seg{t: "⋮ ", fg: th.text, bold: true})
 	}
 	if m.searching() {
 		return m.renderResults(rows, w, h)
 	}
-	rows[1] = m.tabBar(w)
-
 	if len(m.shown) == 0 {
 		t1, t2 := " Nothing here yet", " New messages show up here"
 		if m.tab == 3 {
 			t1, t2 = " No unread chats 🎉", " You're all caught up"
 		}
-		rows[2] = bgr(w, seg{t: trunc(t1, w), fg: th.dim})
-		rows[3] = bgr(w, seg{t: trunc(t2, w), fg: th.dim})
+		rows[1] = bgr(w, seg{t: trunc(t1, w), fg: th.dim})
+		rows[2] = bgr(w, seg{t: trunc(t2, w), fg: th.dim})
 	}
 	perPage, top := m.listGeom(h)
 	for i := 0; i < perPage; i++ {
@@ -1965,19 +2156,23 @@ func (m *tuiModel) renderList(w, h int) []string {
 		if idx >= len(m.shown) {
 			break
 		}
-		r := 2 + i*2
-		if r+1 >= h-2 {
+		r := 1 + i*2
+		if r+1 >= h-navRows {
 			break
 		}
-		rows[r], rows[r+1] = m.listItem(m.shown[idx], idx == m.sel, w)
+		l1, l2 := m.listItem(m.shown[idx], idx == m.sel, w)
+		if rw := fabRowW(w, r+1, h-navRows); rw != w { // row(s) beside the floating buttons
+			n1, n2 := m.listItem(m.shown[idx], idx == m.sel, rw)
+			if fabRowW(w, r, h-navRows) != w {
+				l1 = n1
+			}
+			l2 = n2
+		}
+		rows[r], rows[r+1] = l1, l2
 	}
-	// WhatsApp-style "new chat" button, bottom left
-	rows[h-2] = m.bottomButtons(w)
-	if m.inChat {
-		rows[h-1] = hintRow(w, "Tab", "back to list")
-	} else {
-		rows[h-1] = hintRow(w, "⏎", "open", "c", "contacts", "f", "files", "p", "pin", "←→", "tabs", "u", "unread", "/", "find", "?", "help", "q", "quit")
-	}
+	// WhatsApp-style tab bar at the very bottom; the two buttons float above it, bottom right
+	rows[h-2], rows[h-1] = m.navBar(w)
+	overlayFabs(rows, w, h-navRows)
 	return rows
 }
 
@@ -3019,6 +3214,9 @@ func (m *tuiModel) openRes() tea.Cmd {
 }
 
 func (m *tuiModel) renderResults(rows []string, w, h int) []string {
+	for i := 2; i < h-1; i++ { // rows beside the floating buttons are narrower
+		rows[i] = blankRow(fabRowW(w, i, h-1))
+	}
 	rows[1] = render(th.bar, w, seg{t: trunc(fmt.Sprintf(" Results  %d", len(m.res)), w), fg: th.accent, bold: true})
 	if len(m.res) == 0 {
 		rows[2] = bgr(w, seg{t: trunc(" No matches", w), fg: th.dim})
@@ -3031,13 +3229,21 @@ func (m *tuiModel) renderResults(rows []string, w, h int) []string {
 			break
 		}
 		r := 2 + i*2
-		if r+1 >= h-2 {
+		if r+1 >= h-1 {
 			break
 		}
-		rows[r], rows[r+1] = m.resItem(m.res[idx], idx == m.rsel, w)
+		l1, l2 := m.resItem(m.res[idx], idx == m.rsel, w)
+		if rw := fabRowW(w, r+1, h-1); rw != w {
+			n1, n2 := m.resItem(m.res[idx], idx == m.rsel, rw)
+			if fabRowW(w, r, h-1) != w {
+				l1 = n1
+			}
+			l2 = n2
+		}
+		rows[r], rows[r+1] = l1, l2
 	}
-	rows[h-2] = m.bottomButtons(w)
 	rows[h-1] = hintRow(w, "⏎", "open", "Esc", "clear")
+	overlayFabs(rows, w, h-1)
 	return rows
 }
 
@@ -3086,26 +3292,11 @@ type fileItem struct {
 	mod        time.Time
 }
 
-const (
-	filesBtnX = contactsBtnW + 2 // the 📁 button sits right after "+ Contacts"
-	filesBtnW = 4
-)
-
 // button rows (y) of the file-action screen and of the send-confirmation screen
 var fActY = [3]int{6, 9, 12}
 var fConfY = [2]int{7, 10}
 
 func btnHit(y, base int) bool { return y == base || y == base+1 }
-
-// bottomButtons is the row at the bottom of the chat list: "+ Contacts" and the 📁 button.
-func (m *tuiModel) bottomButtons(w int) string {
-	return bgr(w,
-		seg{t: " "},
-		seg{t: " + Contacts ", fg: th.bg, bg: th.accent, bold: true},
-		seg{t: " "},
-		seg{t: " 📁 ", fg: th.text, bg: th.sel, bold: true},
-	)
-}
 
 func humanSize(n int64) string {
 	const k = 1024.0
