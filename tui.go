@@ -1086,6 +1086,8 @@ func (m *tuiModel) onListKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 		return m, m.openContacts()
 	case "d":
 		m.showDash = true
+	case "t":
+		m.cycleTheme()
 	case "enter":
 		return m, m.openSel()
 	case "tab":
@@ -1382,10 +1384,8 @@ func (m *tuiModel) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.showDash {
 		if msg.Button == tea.MouseButtonLeft {
-			for _, h := range m.dashHits {
-				if h.y == msg.Y {
-					return m, m.openJIDByChat(h.jid)
-				}
+			if mm, cmd, ok := m.dashClick(msg.X, msg.Y); ok {
+				return mm, cmd
 			}
 			m.showDash = false
 		}
@@ -1496,11 +1496,9 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 
 func (m *tuiModel) clickRight(x, y, w int) (tea.Model, tea.Cmd) {
 	h := m.h
-	if m.cur == "" { // home dashboard: tap a chat to open it
-		for _, hit := range m.dashHits {
-			if hit.y == y {
-				return m, m.openJIDByChat(hit.jid)
-			}
+	if m.cur == "" { // home dashboard: tap a chat, card or button
+		if mm, cmd, ok := m.dashClick(x, y); ok {
+			return mm, cmd
 		}
 		return m, nil
 	}
@@ -1765,6 +1763,7 @@ func (m *tuiModel) renderHelp() string {
 	line("p", "pin / unpin chat ★")
 	line("c  or  n", "contacts · new chat")
 	line("d", "home dashboard")
+	line("t", "next theme")
 	line("j k  ↑ ↓", "move")
 	line("/", "search chats · contacts · messages")
 	line("q", "quit")
@@ -2381,27 +2380,86 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID ma
 // ================================================================ home dashboard
 
 type dashHit struct {
-	y   int // pane row
-	jid string
+	y      int    // pane row
+	x0, x1 int    // pane columns [x0, x1)
+	jid    string // tap opens this chat ...
+	act    string // ... or runs this action: new, search, theme, unread, pinned, drafts
 }
 
-// dashLines draws the short home dashboard (ASCII logo, status, unread, top 3).
-// Rows are meant to start at pane row 1; tappable rows are recorded in m.dashHits.
+// dashLogo is the big banner, used when the pane is wide and tall enough.
+var dashLogo = []string{
+	"╔══════════════════════════════════════════╗",
+	"║ ██╗    ██╗ █████╗  ██████╗██╗     ██╗    ║",
+	"║ ██║    ██║██╔══██╗██╔════╝██║     ██║    ║",
+	"║ ██║ █╗ ██║███████║██║     ██║     ██║    ║",
+	"║ ██║███╗██║██╔══██║██║     ██║     ██║    ║",
+	"║ ╚███╔███╔╝██║  ██║╚██████╗███████╗██║    ║",
+	"║  ╚══╝╚══╝ ╚═╝  ╚═╝ ╚═════╝╚══════╝╚═╝    ║",
+	"╚══════════════════════════════════════════╝",
+}
+
+// dashLogoSmall is the 3-row banner for narrow or short screens.
+var dashLogoSmall = []string{"╦ ╦╔═╗╔═╗╦  ╦", "║║║╠═╣║  ║  ║", "╚╩╝╩ ╩╚═╝╩═╝╩"}
+
+// padCenter centres s inside w columns (cut to w if it is longer).
+func padCenter(s string, w int) string {
+	n := runewidth.StringWidth(s)
+	if n >= w {
+		return runewidth.Truncate(s, w, "")
+	}
+	l := (w - n) / 2
+	return spaces(l) + s + spaces(w-n-l)
+}
+
+// dashLines draws the home dashboard: logo, status, stat cards, unread (or recent)
+// chats and quick buttons. Rows are meant to start at pane row 1. Tappable spots are
+// recorded in m.dashHits with pane-relative columns.
 func (m *tuiModel) dashLines(w int) []string {
 	m.dashHits = m.dashHits[:0]
 	var rows []string
-	add := func(segs ...seg) { rows = append(rows, bgr(w, segs...)) }
-	blank := func() { rows = append(rows, blankRow(w)) }
+	limit := m.h - 3 // rows that stay visible in both the full-screen and the split layout
+	compact := limit < 22
+
+	cw := clamp(w-2, 20, 44) // content column, centred in the pane
+	x0 := max(1, (w-cw)/2)
+
+	add := func(segs ...seg) {
+		rows = append(rows, bgr(w, append([]seg{{t: spaces(x0)}}, segs...)...))
+	}
+	blank := func() {
+		if !compact {
+			rows = append(rows, blankRow(w))
+		}
+	}
 	text := func(fg lipgloss.Color, bold bool, t string) {
-		add(seg{t: " " + trunc(t, max(1, w-2)), fg: fg, bold: bold})
+		add(seg{t: " " + trunc(t, max(1, cw-1)), fg: fg, bold: bold})
+	}
+	// hit marks columns a..b of the row that the NEXT add() call will draw.
+	hit := func(a, b int, jid, act string) {
+		m.dashHits = append(m.dashHits, dashHit{y: 1 + len(rows), x0: x0 + a, x1: x0 + b, jid: jid, act: act})
 	}
 
+	// ---- logo + status
 	blank()
-	for _, l := range []string{"╦ ╦╔═╗╔═╗╦  ╦", "║║║╠═╣║  ║  ║", "╚╩╝╩ ╩╚═╝╩═╝╩"} {
-		text(th.accent, true, "  "+l)
+	if !compact && cw >= 44 && limit >= 34 {
+		for i, l := range dashLogo {
+			if i == 0 || i == len(dashLogo)-1 {
+				add(seg{t: l, fg: th.dim})
+				continue
+			}
+			r := []rune(l)
+			add(
+				seg{t: string(r[:1]), fg: th.dim},
+				seg{t: string(r[1 : len(r)-1]), fg: th.accent, bold: true},
+				seg{t: string(r[len(r)-1:]), fg: th.dim},
+			)
+		}
+	} else {
+		for _, l := range dashLogoSmall {
+			add(seg{t: " " + l, fg: th.accent, bold: true})
+		}
 	}
-	text(th.dim, false, "  WhatsApp from your terminal")
-	blank()
+	text(th.dim, false, "WhatsApp from your terminal")
 
 	dot, state := lipgloss.Color("#F15C6D"), "offline"
 	if m.online {
@@ -2411,7 +2469,7 @@ func (m *tuiModel) dashLines(w int) []string {
 	if m.st.Mode == "daemon" {
 		mode = "daemon"
 	}
-	add(seg{t: " ● ", fg: dot}, seg{t: trunc(state+" · "+mode, max(1, w-4)), fg: th.text})
+	add(seg{t: " ● ", fg: dot}, seg{t: trunc(state+" · "+mode, max(1, cw-3)), fg: th.text})
 
 	who := strings.TrimSpace(m.st.PushName)
 	if m.st.Phone != "" {
@@ -2421,39 +2479,250 @@ func (m *tuiModel) dashLines(w int) []string {
 		who += "+" + m.st.Phone
 	}
 	if who != "" {
-		text(th.dim, false, "   "+who)
+		text(th.dim, false, "  "+who)
 	}
-	blank()
 
+	// ---- numbers
 	un := m.unreadChats()
 	total := 0
 	for _, c := range un {
 		total += c.Unread
 	}
-	if total == 0 {
-		text(th.accent, false, "✓ all caught up")
-	} else {
-		text(th.text, true, fmt.Sprintf("✉ %d unread · %d chats", total, len(un)))
-		for i, c := range un {
-			if i == 3 {
-				break
-			}
-			badge := " " + unreadLabel(c.Unread) + " "
-			bw := runewidth.StringWidth(badge)
-			nm := trunc(clean(c.Title()), max(1, w-6-bw))
-			gap := max(1, w-4-runewidth.StringWidth(nm)-bw-1)
-			m.dashHits = append(m.dashHits, dashHit{y: 1 + len(rows), jid: c.JID})
-			add(
-				seg{t: "  ▸ ", fg: th.accent},
-				seg{t: nm, fg: th.text},
-				seg{t: spaces(gap)},
-				seg{t: badge, fg: th.bg, bg: th.accent, bold: true},
-			)
+	pins := 0
+	for _, c := range m.chats {
+		if m.pinned[c.JID] && chatKind(c.JID) >= 0 {
+			pins++
 		}
 	}
+	drafts := 0
+	for _, d := range m.drafts {
+		if strings.TrimSpace(d) != "" {
+			drafts++
+		}
+	}
+
+	// ---- stat cards (tap: unread tab, chat list, first draft)
+	if !compact {
+		blank()
+		inner := cw - 4
+		cwid := [3]int{inner / 3, inner / 3, inner - 2*(inner/3)}
+		vals := [3]string{"✉ " + strconv.Itoa(total), "★ " + strconv.Itoa(pins), "✎ " + strconv.Itoa(drafts)}
+		labs := [3]string{"unread", "pinned", "drafts"}
+		acts := [3]string{"unread", "pinned", "drafts"}
+		fgs := [3]lipgloss.Color{th.dim, th.dim, th.dim}
+		if total > 0 {
+			fgs[0] = th.accent
+		}
+		if pins > 0 {
+			fgs[1] = warnColor
+		}
+		if drafts > 0 {
+			fgs[2] = draftColor
+		}
+		border := func(l, mid, r string) {
+			s := l
+			for i := 0; i < 3; i++ {
+				s += strings.Repeat("─", cwid[i])
+				if i < 2 {
+					s += mid
+				} else {
+					s += r
+				}
+			}
+			add(seg{t: s, fg: th.dim})
+		}
+		border("┌", "┬", "┐")
+		for r := 0; r < 2; r++ {
+			segs := []seg{{t: "│", fg: th.dim}}
+			x := 1
+			for i := 0; i < 3; i++ {
+				txt, fg, bold := vals[i], fgs[i], true
+				if r == 1 {
+					txt, fg, bold = labs[i], th.dim, false
+				}
+				segs = append(segs,
+					seg{t: padCenter(txt, cwid[i]), fg: fg, bg: th.pill, bold: bold},
+					seg{t: "│", fg: th.dim})
+				hit(x, x+cwid[i], "", acts[i])
+				x += cwid[i] + 1
+			}
+			add(segs...)
+		}
+		border("└", "┴", "┘")
+	}
+
+	// ---- unread chats (or the latest chats when everything is read)
 	blank()
-	text(th.dim, false, "c contacts · u unread · ? help")
+	list := un
+	if len(un) > 0 {
+		text(th.text, true, fmt.Sprintf("UNREAD  %d msgs · %d chats", total, len(un)))
+	} else {
+		list = nil
+		for _, c := range m.chats {
+			if chatKind(c.JID) >= 0 && c.LastTS > 0 {
+				list = append(list, c)
+			}
+		}
+		sort.SliceStable(list, func(i, j int) bool { return list[i].LastTS > list[j].LastTS })
+		if len(list) > 0 {
+			text(th.accent, true, "✓ ALL CAUGHT UP · RECENT")
+		} else {
+			text(th.accent, true, "✓ ALL CAUGHT UP")
+		}
+	}
+
+	tail := 2 // buttons row + hint row
+	if !compact {
+		tail += 2 // blank rows above them
+	}
+	free := limit - len(rows) - tail
+	maxN := min(len(list), 5)
+	perItem := 2 // name row + preview row
+	n := min(maxN, free/2)
+	if n < min(maxN, 3) {
+		perItem = 1
+		n = min(maxN, max(0, free))
+	}
+	for i := 0; i < n; i++ {
+		c := list[i]
+		badge := ""
+		if c.Unread > 0 {
+			badge = " " + unreadLabel(c.Unread) + " "
+		}
+		bw := runewidth.StringWidth(badge)
+		tm := listTime(c.LastTS)
+		tw := runewidth.StringWidth(tm)
+		right := bw + tw
+		if bw > 0 && tw > 0 {
+			right++
+		}
+		nm := trunc(clean(c.Title()), max(1, cw-3-right-1))
+		gap := max(1, cw-3-runewidth.StringWidth(nm)-right)
+		segs := []seg{
+			{t: " ▸ ", fg: th.accent},
+			{t: nm, fg: th.text, bold: c.Unread > 0},
+			{t: spaces(gap)},
+		}
+		if bw > 0 {
+			segs = append(segs, seg{t: badge, fg: th.bg, bg: th.accent, bold: true})
+		}
+		if bw > 0 && tw > 0 {
+			segs = append(segs, seg{t: " "})
+		}
+		segs = append(segs, seg{t: tm, fg: th.dim})
+		hit(0, cw, c.JID, "")
+		add(segs...)
+		if perItem == 2 {
+			pv := strings.ReplaceAll(clean(prettyPreview(c.LastText)), "\n", " ")
+			hit(0, cw, c.JID, "")
+			add(seg{t: "   " + trunc(pv, max(1, cw-3)), fg: th.dim})
+		}
+	}
+
+	// ---- quick buttons
+	blank()
+	type btn struct{ key, label, act string }
+	btns := []btn{{"+", "New", "new"}, {"/", "Search", "search"}, {"t", "Theme", "theme"}}
+	var bsegs []seg
+	bx := 0
+	for i, b := range btns {
+		if i > 0 {
+			bsegs = append(bsegs, seg{t: "  "})
+			bx += 2
+		}
+		wd := runewidth.StringWidth(" " + b.key + " " + b.label + " ")
+		bsegs = append(bsegs,
+			seg{t: " " + b.key, fg: th.accent, bg: th.sel, bold: true},
+			seg{t: " " + b.label + " ", fg: th.text, bg: th.sel})
+		hit(bx, bx+wd, "", b.act)
+		bx += wd
+	}
+	add(bsegs...)
+
+	blank()
+	text(th.dim, false, "c contacts · u unread · t theme · ? help")
 	return rows
+}
+
+// dashClick handles a tap at pane column x, row y on the dashboard.
+// The bool is false when nothing tappable was hit.
+func (m *tuiModel) dashClick(x, y int) (tea.Model, tea.Cmd, bool) {
+	for _, h := range m.dashHits {
+		if h.y != y || x < h.x0 || x >= h.x1 {
+			continue
+		}
+		if h.jid != "" {
+			return m, m.openJIDByChat(h.jid), true
+		}
+		switch h.act {
+		case "new":
+			m.showDash = false
+			return m, m.openContacts(), true
+		case "search":
+			m.showDash = false
+			m.filtering = true
+			m.filter.Focus()
+			if !m.contactsOK {
+				return m, tea.Batch(textinput.Blink, m.loadContacts()), true
+			}
+			return m, textinput.Blink, true
+		case "theme":
+			m.cycleTheme()
+			return m, nil, true
+		case "unread":
+			m.showDash = false
+			m.setTab(3)
+			return m, nil, true
+		case "pinned":
+			m.showDash = false
+			m.setTab(0)
+			return m, nil, true
+		case "drafts":
+			if jid := m.firstDraft(); jid != "" {
+				return m, m.openJIDByChat(jid), true
+			}
+			return m, nil, true
+		}
+	}
+	return m, nil, false
+}
+
+// firstDraft is the chat with unsent text that shows first in the chat list.
+func (m *tuiModel) firstDraft() string {
+	for _, c := range m.chats {
+		if strings.TrimSpace(m.drafts[c.JID]) != "" {
+			return c.JID
+		}
+	}
+	var keys []string
+	for j, d := range m.drafts {
+		if strings.TrimSpace(d) != "" {
+			keys = append(keys, j)
+		}
+	}
+	sort.Strings(keys)
+	if len(keys) > 0 {
+		return keys[0]
+	}
+	return ""
+}
+
+// cycleTheme switches to the next theme and saves it in config.json.
+func (m *tuiModel) cycleTheme() {
+	names := themeNames()
+	next := names[0]
+	for i, n := range names {
+		if themes[n] == th {
+			next = names[(i+1)%len(names)]
+			break
+		}
+	}
+	applyTheme(next)
+	c := loadConfig()
+	c.Theme = next
+	_ = c.Save()
+	m.restyle()
+	m.status = "theme: " + next
 }
 
 // renderDashScreen is the full-screen dashboard (phones: tap the "● wacli" bar or press d).
