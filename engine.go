@@ -416,6 +416,14 @@ func (e *Engine) syncNames() {
 			e.st.setName(g.JID.String(), g.Name, 3)
 		}
 	}
+	// channels (newsletters): they have no contact entry, so fetch their names explicitly
+	if ns, err := e.cli.GetSubscribedNewsletters(ctx); err == nil {
+		for _, n := range ns {
+			if n != nil {
+				e.st.setName(n.ID.String(), n.ThreadMeta.Name.Text, 3)
+			}
+		}
+	}
 	e.emit(Event{Type: "update"})
 }
 

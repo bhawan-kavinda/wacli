@@ -115,7 +115,7 @@ func render(bg lipgloss.Color, width int, segs ...seg) string {
 			continue
 		}
 		b.WriteString(segStyle(s, bg).Render(s.t))
-		used += runewidth.StringWidth(s.t)
+		used += sw(s.t)
 	}
 	if used < width {
 		b.WriteString(segStyle(seg{}, bg).Render(strings.Repeat(" ", width-used)))
@@ -129,7 +129,7 @@ func blankRow(w int) string         { return render(th.bg, w) }
 func segsWidth(segs []seg) int {
 	n := 0
 	for _, s := range segs {
-		n += runewidth.StringWidth(s.t)
+		n += sw(s.t)
 	}
 	return n
 }
@@ -155,7 +155,7 @@ func trunc(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
-	return runewidth.Truncate(s, w, "…")
+	return truncW(s, w, "…")
 }
 
 func clean(s string) string {
@@ -163,16 +163,106 @@ func clean(s string) string {
 	return strings.ReplaceAll(s, "\t", "  ")
 }
 
+// ---- display width. Termux gives spacing combining marks (Unicode class Mc - most Sinhala and
+// Tamil vowel signs) a cell of their own, while runewidth counts them as 0, so long Indic lines
+// overflowed their box. Non-spacing marks (Mn), joiners and variation selectors stay 0 wide.
+
+func rwidth(r rune) int {
+	w := runewidth.RuneWidth(r)
+	if w == 0 && unicode.Is(unicode.Mc, r) {
+		return 1
+	}
+	return w
+}
+
+func sw(s string) int {
+	n := 0
+	for _, r := range s {
+		n += rwidth(r)
+	}
+	return n
+}
+
+// truncW cuts s to at most w cells, adding tail when something was cut.
+func truncW(s string, w int, tail string) string {
+	if sw(s) <= w {
+		return s
+	}
+	tw := sw(tail)
+	if w <= tw {
+		tail, tw = "", 0
+	}
+	var b strings.Builder
+	cur := 0
+	for _, r := range s {
+		rw := rwidth(r)
+		if cur+rw > w-tw {
+			break
+		}
+		b.WriteRune(r)
+		cur += rw
+	}
+	return b.String() + tail
+}
+
+func fillRightW(s string, w int) string {
+	if n := sw(s); n < w {
+		return s + strings.Repeat(" ", w-n)
+	}
+	return s
+}
+
+// wrapText wraps s to w cells: words move to the next line, over-long words (URLs) are
+// broken, blank lines and indentation are kept.
 func wrapText(s string, w int) []string {
 	if w < 4 {
 		w = 4
 	}
-	out := lipgloss.NewStyle().Width(w).Render(s)
-	lines := strings.Split(out, "\n")
-	for i := range lines {
-		lines[i] = strings.TrimRight(lines[i], " ")
+	var out []string
+	for _, para := range strings.Split(s, "\n") {
+		line, lw := "", 0
+		flush := func() {
+			out = append(out, strings.TrimRight(line, " "))
+			line, lw = "", 0
+		}
+		rs := []rune(para)
+		for i := 0; i < len(rs); {
+			j := i
+			space := rs[i] == ' '
+			for j < len(rs) && (rs[j] == ' ') == space {
+				j++
+			}
+			tok := string(rs[i:j])
+			tw := sw(tok)
+			i = j
+			switch {
+			case space:
+				if lw+tw > w {
+					flush()
+				} else {
+					line += tok
+					lw += tw
+				}
+			case lw+tw <= w:
+				line += tok
+				lw += tw
+			default:
+				if lw > 0 {
+					flush()
+				}
+				for _, r := range tok {
+					rw := rwidth(r)
+					if lw+rw > w && lw > 0 {
+						flush()
+					}
+					line += string(r)
+					lw += rw
+				}
+			}
+		}
+		flush()
 	}
-	return lines
+	return out
 }
 
 func initials(name string) string {
@@ -281,8 +371,12 @@ func chatKind(jid string) int {
 	return 0
 }
 
-func tabName(k int) string  { return [...]string{"Chats", "Groups", "Channels", "Unread"}[k] }
-func tabShort(k int) string { return [...]string{"Chats", "Grp", "Chan", "Unread"}[k] }
+const tabSettings = 4 // 5th tab of the bottom bar: opens the settings screen
+
+func tabName(k int) string {
+	return [...]string{"Chats", "Groups", "Channels", "Unread", "Settings"}[k]
+}
+func tabShort(k int) string { return [...]string{"Chats", "Grp", "Chan", "Unread", "Set"}[k] }
 
 func unreadLabel(n int) string {
 	if n > 99 {
@@ -374,6 +468,8 @@ type tuiModel struct {
 	picker     bool
 	confirmDel bool
 	showHelp   bool
+	showSettings bool // settings screen (tap the gear)
+	setSel       int
 
 	// contacts picker (WhatsApp-style "new chat")
 	contactsMode bool
@@ -404,6 +500,9 @@ type tuiModel struct {
 
 	// file browser (the 📁 button): browse the download folder, open or send a file
 	showFiles bool
+	showFileSheet bool // the small "Photos / Files" chooser sheet
+	sheetSel      int
+	fMode         int // 0 = all files, 1 = photos only
 	fStage    int // 0 file list · 1 open/send · 2 pick a chat · 3 confirm
 	fDir      string
 	fItems    []fileItem
@@ -452,15 +551,15 @@ func runTUI(b Backend) error {
 	ti.Placeholder = "Type a message…  (/help)"
 	ti.CharLimit = 60000
 	fi := textinput.New()
-	fi.Prompt = "🔍 "
+	fi.Prompt = uiIcon("search") + " "
 	fi.Placeholder = "search"
 
 	ci := textinput.New()
-	ci.Prompt = "🔍 "
+	ci.Prompt = uiIcon("search") + " "
 	ci.Placeholder = "name or number"
 
 	ffi := textinput.New()
-	ffi.Prompt = "🔍 "
+	ffi.Prompt = uiIcon("search") + " "
 	ffi.Placeholder = "send to… (name)"
 
 	m := &tuiModel{be: b, input: ti, filter: fi, cfilter: ci, ffilter: ffi, selMsg: -1,
@@ -1016,8 +1115,29 @@ func (m *tuiModel) onKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.quit()
 	}
 	m.status = ""
+	if m.showFileSheet {
+		switch s {
+		case "esc", "q":
+			m.showFileSheet = false
+		case "up", "k", "down", "j":
+			m.sheetSel = 1 - m.sheetSel
+		case "p", "1":
+			return m, m.openPhotos()
+		case "f", "2":
+			return m, m.openFiles()
+		case "enter", " ":
+			if m.sheetSel == 0 {
+				return m, m.openPhotos()
+			}
+			return m, m.openFiles()
+		}
+		return m, nil
+	}
 	if m.showFiles {
 		return m.onFilesKey(k, s)
+	}
+	if m.showSettings {
+		return m.onSettingsKey(k)
 	}
 	if m.showHelp {
 		m.showHelp = false
@@ -1119,7 +1239,7 @@ func (m *tuiModel) onListKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 	case "d":
 		m.showDash = true
 	case "f":
-		return m, m.openFiles()
+		return m, m.openFileSheet()
 	case "t":
 		m.cycleTheme()
 	case "enter":
@@ -1162,6 +1282,12 @@ func (m *tuiModel) onChatKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 	}
 
 	if m.selMsg >= 0 { // picking a message
+		if strings.HasSuffix(m.cur, "@newsletter") {
+			switch s { // channels are read-only: no reply / edit / delete / react
+			case "r", "enter", "e", "d", "+", "x":
+				return m, nil
+			}
+		}
 		switch s {
 		case "up", "k":
 			m.selMsg = max(0, m.selMsg-1)
@@ -1203,6 +1329,27 @@ func (m *tuiModel) onChatKey(k tea.KeyMsg, s string) (tea.Model, tea.Cmd) {
 			m.status = "⚠ no downloadable media in this message"
 		case "+", "x":
 			m.picker = true
+		}
+		return m, nil
+	}
+
+	if strings.HasSuffix(m.cur, "@newsletter") { // channels are read-only: scroll and go back
+		switch s {
+		case "esc", "q", "left", "h":
+			return m, m.leaveChat()
+		case "tab":
+			m.inChat = false
+			m.input.Blur()
+		case "up", "k":
+			m.scroll += 3
+		case "down", "j":
+			m.scroll = max(0, m.scroll-3)
+		case "pgup", "ctrl+u":
+			m.scroll += page
+		case "pgdown", "ctrl+d":
+			m.scroll = max(0, m.scroll-page)
+		case "end":
+			m.scroll = 0
 		}
 		return m, nil
 	}
@@ -1448,6 +1595,39 @@ func (m *tuiModel) onMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if msg.Action != tea.MouseActionPress {
 		return m, nil
 	}
+	if m.showFileSheet {
+		if msg.Button == tea.MouseButtonLeft {
+			y0 := m.h - sheetH
+			switch {
+			case msg.Y >= y0+2 && msg.Y < y0+4:
+				return m, m.openPhotos()
+			case msg.Y >= y0+4 && msg.Y < y0+6:
+				return m, m.openFiles()
+			case msg.Y >= y0 && msg.Y < y0+2, msg.Y == y0+6:
+				// title / spacing inside the sheet: ignore
+			default: // Cancel, or a tap outside the sheet
+				m.showFileSheet = false
+			}
+		}
+		return m, nil
+	}
+	if m.showSettings {
+		if msg.Button == tea.MouseButtonLeft {
+			items := m.settingsItems()
+			if msg.Y >= m.h-navRows { // bottom tab bar: jump to another tab
+				for _, p := range m.navCells(m.w) {
+					if msg.X >= p.x0 && msg.X < p.x1 && p.kind != tabSettings {
+						m.showSettings = false
+						m.setTab(p.kind)
+					}
+				}
+			} else if slot := (msg.Y - 2) / 3; msg.Y >= 2 && slot < len(items) {
+				m.setSel = slot
+				m.toggleSetting(slot)
+			}
+		}
+		return m, nil
+	}
 	if m.showHelp {
 		if msg.Button == tea.MouseButtonLeft {
 			m.showHelp = false
@@ -1546,7 +1726,7 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 		case fabHit(x, y, w, h-1) == fabContacts:
 			return m, m.openContacts()
 		case fabHit(x, y, w, h-1) == fabFiles:
-			return m, m.openFiles()
+			return m, m.openFileSheet()
 		case y >= topRows && y < h-1:
 			perPage, top := m.resGeom(h)
 			slot := (y - topRows) / 2
@@ -1561,17 +1741,17 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 	case fabHit(x, y, w, h-navRows) == fabContacts:
 		return m, m.openContacts()
 	case fabHit(x, y, w, h-navRows) == fabFiles:
-		return m, m.openFiles()
-	case y == 0 && !m.filtering:
-		m.showDash = true // tap the "WhatsApp" title for the home dashboard
-	case y >= 1 && y <= 3 && !m.filtering: // tap the search pill (3 rows tall)
+		return m, m.openFileSheet()
+	case y <= 1 && !m.filtering:
+		m.showDash = true // tap the title for the home dashboard
+	case y >= 2 && y <= 4 && !m.filtering: // tap the search pill (3 rows tall)
 		m.filtering = true
 		m.filter.Focus()
 		if !m.contactsOK {
 			return m, tea.Batch(textinput.Blink, m.loadContacts())
 		}
 		return m, textinput.Blink
-	case y == 4: // filter chips
+	case y == 5: // filter chips
 		for _, p := range m.chipLayout(w) {
 			if x >= p.x0 && x < p.x1 {
 				m.setTab(p.kind)
@@ -1580,6 +1760,10 @@ func (m *tuiModel) clickLeft(x, y, w int) (tea.Model, tea.Cmd) {
 	case y >= h-navRows: // bottom tab bar
 		for _, p := range m.navCells(w) {
 			if x >= p.x0 && x < p.x1 {
+				if p.kind == tabSettings {
+					m.showSettings = true
+					continue
+				}
 				m.setTab(p.kind)
 			}
 		}
@@ -1811,6 +1995,15 @@ func (m *tuiModel) View() string {
 	if m.h < 8 {
 		return "terminal too small"
 	}
+	if m.showFileSheet {
+		m.showFileSheet = false
+		base := m.View()
+		m.showFileSheet = true
+		return m.overlaySheet(base)
+	}
+	if m.showSettings {
+		return m.renderSettings()
+	}
 	if m.showHelp {
 		return m.renderHelp()
 	}
@@ -1853,7 +2046,7 @@ func (m *tuiModel) renderHelp() string {
 	line := func(k, d string) {
 		budget := max(0, w-3-12-1)
 		rows = append(rows, bgr(w,
-			seg{t: "   " + runewidth.FillRight(k, 12), fg: th.text, bold: true},
+			seg{t: "   " + fillRightW(k, 12), fg: th.text, bold: true},
 			seg{t: trunc(d, budget), fg: th.dim}))
 	}
 	blank := func() { rows = append(rows, blankRow(w)) }
@@ -1866,7 +2059,7 @@ func (m *tuiModel) renderHelp() string {
 	line("u", "unread tab on / off")
 	line("p", "pin / unpin chat ★")
 	line("c  or  n", "contacts · new chat")
-	line("f", "files · open / send a download")
+	line("f", "photos or files · open / send")
 	line("d", "home dashboard")
 	line("t", "next theme")
 	line("j k  ↑ ↓", "move")
@@ -1875,7 +2068,7 @@ func (m *tuiModel) renderHelp() string {
 	blank()
 	title("Touch")
 	line("tap", "open chat · tab · button")
-	line("tap 📁", "browse files · open or send")
+	line("tap Files", "browse files · open or send")
 	line("swipe ↕", "scroll list or messages")
 	line("swipe ← →", "next / previous tab (chat list)")
 	line("tap message", "pick it (reply, react…)")
@@ -1935,7 +2128,7 @@ func (m *tuiModel) tabLayout(w int) []tabPos {
 				label += " " + unreadLabel(n)
 			}
 			label += " "
-			lw := runewidth.StringWidth(label)
+			lw := sw(label)
 			if used+lw > w {
 				fits = false
 				break
@@ -1972,7 +2165,7 @@ func (m *tuiModel) tabBar(w int) string {
 
 const navRows = 2 // height of the bottom tab bar: icon row + label row
 // Top area, WhatsApp style (6 rows): 0 title, 1-3 rounded search pill, 4 filter chips, 5 spacer.
-const topRows = 6
+const topRows = 7
 const itemRows = 4 // one chat card in the list: name row, preview row, breathing row (avatar spans all 3)
 
 // chipName: the filter-chip label for a tab (WhatsApp calls the first one "All").
@@ -1991,7 +2184,7 @@ func (m *tuiModel) chipLayout(w int) []tabPos {
 			}
 		}
 		label += " "
-		cw := runewidth.StringWidth(label) + 2
+		cw := sw(label) + 2
 		if x+cw > w {
 			break
 		}
@@ -2024,41 +2217,67 @@ func pillCap(left bool, c lipgloss.Color) seg {
 	return seg{t: g, fg: c, bg: th.bg}
 }
 
+// uiIcon returns a UI icon: an emoji that fits the place, or with rounded_caps (Nerd Font)
+// a real font icon instead.
+func uiIcon(name string) string {
+	nerd := map[string]string{
+		"search": "\uf002", "photo": "\uf03e", "gear": "\uf013", "chats": "\uf075", "groups": "\uf0c0",
+		"channels": "\uf0a1", "unread": "\uf0f3", "pin": "\uf08d", "folder": "\uf07b",
+	}
+	plain := map[string]string{
+		"search": "🔍", "photo": "📷", "gear": "🔧", "chats": "💬", "groups": "👥",
+		"channels": "📢", "unread": "🔔", "pin": "📌", "folder": "📁",
+	}
+	if roundCaps {
+		return nerd[name]
+	}
+	return plain[name]
+}
+
+// uiIcon2 is uiIcon padded to exactly two cells (emoji are two wide, font icons one).
+func uiIcon2(name string) string {
+	s := uiIcon(name)
+	if sw(s) < 2 {
+		s += " "
+	}
+	return s
+}
+
 // glyphRow paints raw block glyphs (fg colour on the page background) - used for the
 // rounded edges of the search pill.
 func glyphRow(w int, fg lipgloss.Color, s string) string {
-	return blankRow(1) + segStyle(seg{fg: fg}, th.bg).Render(s) + blankRow(w-1-runewidth.StringWidth(s))
+	return blankRow(1) + segStyle(seg{fg: fg}, th.bg).Render(s) + blankRow(w-1-sw(s))
 }
 
 // topBar draws the WhatsApp-style header of the chat list (see topRows):
 //
-//	row 0     WhatsApp                          ●  ⋮
+//	rows 0-1  ｗａｃｌｉ                   ●  [⚙]   (title band + ═══ double-line bar)
 //	rows 1-3  ╭ 🔍  Search chats, contacts… ╮   (rounded pill, a tap starts the search)
 //	row 4     ( All ) ( Groups ) ( Unread 3 )   (filter chips, active one is green)
 //	row 5     spacer
 func (m *tuiModel) topBar(w int) []string {
 	rows := make([]string, topRows)
 
-	// row 0: bold title + connection dot + menu
+	// rows 0-1: two-row header. Row 0: big title (full-width letters), connection dot and a
+	// gear button; row 1: a double-line bar under it.
 	dotFg := lipgloss.Color("#F15C6D")
 	if m.online {
 		dotFg = th.accent
 	}
-	rows[0] = render(th.bg, w,
-		seg{t: " WhatsApp", fg: th.text, bold: true},
-		seg{t: spaces(max(1, w-9-5))},
-		seg{t: "●", fg: dotFg},
-		seg{t: "  "},
-		seg{t: "⋮ ", fg: th.text, bold: true})
+	rows[0] = render(th.bar, w,
+		seg{t: " ｗａｃｌｉ ", fg: th.accent, bold: true},
+		seg{t: spaces(max(0, w-12-3))},
+		seg{t: " ● ", fg: dotFg})
+	rows[1] = render(th.bg, w, seg{t: strings.Repeat("═", w), fg: th.accent})
 
 	// rows 1-3: search pill. Half blocks + quadrant corners make the top and bottom edges
 	// look rounded; the middle row is the real text box while searching.
 	if iw := w - 2; iw < 6 {
-		rows[1], rows[2], rows[3] = blankRow(w), blankRow(w), blankRow(w)
+		rows[2], rows[3], rows[4] = blankRow(w), blankRow(w), blankRow(w)
 	} else {
 		if roundCaps {
 			// one smooth row: half-circle cap + body + half-circle cap
-			rows[1], rows[3] = blankRow(w), blankRow(w)
+			rows[2], rows[4] = blankRow(w), blankRow(w)
 			bw := iw - 2
 			var mid string
 			if m.filtering {
@@ -2068,12 +2287,12 @@ func (m *tuiModel) topBar(w int) []string {
 					mid += render(th.bar, pad)
 				}
 			} else {
-				mid = render(th.bar, bw, seg{t: trunc(" 🔍  Search chats, contacts, messages", bw), fg: th.dim})
+				mid = render(th.bar, bw, seg{t: trunc(" "+uiIcon("search")+"  Search chats, contacts, messages", bw), fg: th.dim})
 			}
-			rows[2] = blankRow(1) + render(th.bg, 1, pillCap(true, th.bar)) + mid +
+			rows[3] = blankRow(1) + render(th.bg, 1, pillCap(true, th.bar)) + mid +
 				render(th.bg, 1, pillCap(false, th.bar)) + blankRow(1)
 		} else {
-			rows[1] = blankRow(1) + render(th.bar, iw) + blankRow(1) // solid pill, no half-block glyphs
+			rows[2] = blankRow(1) + render(th.bar, iw) + blankRow(1) // solid pill, no half-block glyphs
 			var mid string
 			if m.filtering {
 				v := m.filter.View()
@@ -2084,15 +2303,15 @@ func (m *tuiModel) topBar(w int) []string {
 				mid += blankRow(1)
 			} else {
 				mid = blankRow(1) +
-					render(th.bar, iw, seg{t: trunc("  🔍  Search chats, contacts, messages", iw), fg: th.dim}) +
+					render(th.bar, iw, seg{t: trunc("  "+uiIcon("search")+"  Search chats, contacts, messages", iw), fg: th.dim}) +
 					blankRow(1)
 			}
-			rows[2] = mid
-			rows[3] = blankRow(1) + render(th.bar, iw) + blankRow(1)
+			rows[3] = mid
+			rows[4] = blankRow(1) + render(th.bar, iw) + blankRow(1)
 		}
 	}
 
-	// row 4: filter chips with rounded caps
+	// row 5: filter chips with rounded caps
 	var segs []seg
 	cur := 0
 	for _, p := range m.chipLayout(w) {
@@ -2109,16 +2328,18 @@ func (m *tuiModel) topBar(w int) []string {
 			pillCap(false, chipBg))
 		cur = p.x1
 	}
-	rows[4] = bgr(w, segs...)
-	rows[5] = blankRow(w)
+	rows[5] = bgr(w, segs...)
+	rows[6] = blankRow(w)
 	return rows
 }
 
-func tabIcon(k int) string { return [...]string{"💬", "👥", "📢", "🔔"}[k] }
+func tabIcon(k int) string {
+	return uiIcon([...]string{"chats", "groups", "channels", "unread", "gear"}[k])
+}
 
 // navCells splits the bottom tab bar into one equal-width cell per tab.
 func (m *tuiModel) navCells(w int) []tabPos {
-	list := m.tabList()
+	list := append(m.tabList(), tabSettings)
 	n := len(list)
 	out := make([]tabPos, 0, n)
 	for i, k := range list {
@@ -2133,9 +2354,9 @@ func (m *tuiModel) navBar(w int) (string, string) {
 	var icons, labels []seg
 	for _, p := range m.navCells(w) {
 		cw := p.x1 - p.x0
-		active := p.kind == m.tab
+		active := p.kind == m.tab && !m.showSettings || p.kind == tabSettings && m.showSettings
 
-		pill := seg{t: " " + tabIcon(p.kind) + " ", fg: th.text}
+		pill := seg{t: "  " + tabIcon(p.kind) + "  ", fg: th.text}
 		if active {
 			pill.bg = th.me
 		}
@@ -2152,11 +2373,11 @@ func (m *tuiModel) navBar(w int) (string, string) {
 		icons = append(icons, seg{t: spaces(left)}, pill, badge, seg{t: spaces(max(0, cw-tw-left))})
 
 		name := tabName(p.kind)
-		if runewidth.StringWidth(name)+1 > cw {
+		if sw(name)+1 > cw {
 			name = tabShort(p.kind)
 		}
 		name = trunc(name, cw)
-		nw := runewidth.StringWidth(name)
+		nw := sw(name)
 		pad := max(0, (cw-nw)/2)
 		lab := seg{t: name, fg: th.dim}
 		if active {
@@ -2208,11 +2429,11 @@ func fabHit(x, y, w, bottom int) int {
 func fabLine(kind, row int) string {
 	fg, bg, label := th.bg, th.accent, "+ Contacts"
 	if kind == fabFiles {
-		fg, bg, label = th.text, th.sel, "📁 Files"
+		fg, bg, label = th.text, th.sel, uiIcon("folder")+" Files"
 	}
 	var body []seg
 	if row == fabH/2 {
-		lw := runewidth.StringWidth(label)
+		lw := sw(label)
 		l := max(0, (fabW-lw)/2)
 		body = []seg{
 			{t: spaces(l), bg: bg},
@@ -2366,7 +2587,7 @@ func (m *tuiModel) contactItem(c Contact, selected bool, w int) (string, string)
 		bg = th.sel
 	}
 	name := clean(contactTitle(c))
-	av := runewidth.FillRight(runewidth.Truncate(initials(strings.TrimPrefix(name, "+")), 2, ""), 2)
+	av := fillRightW(truncW(initials(strings.TrimPrefix(name, "+")), 2, ""), 2)
 	l1 := render(bg, w,
 		seg{t: " "},
 		seg{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(c.JID, len(avatarBgs))], bold: true},
@@ -2395,16 +2616,16 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 		bg = th.sel
 	}
 	name := clean(c.Title())
-	ini := runewidth.FillRight(runewidth.Truncate(initials(name), 2, ""), 2)
+	ini := fillRightW(truncW(initials(name), 2, ""), 2)
 	avBg := avatarBgs[hashIdx(c.JID, len(avatarBgs))]
 	tm := listTime(c.LastTS)
-	tmW := runewidth.StringWidth(tm)
+	tmW := sw(tm)
 	tmFg := th.dim
 	if c.Unread > 0 {
 		tmFg = th.accent
 	}
 	nm := trunc(name, max(1, w-listIndent-tmW-1))
-	gap := max(1, w-listIndent-runewidth.StringWidth(nm)-tmW-1)
+	gap := max(1, w-listIndent-sw(nm)-tmW-1)
 	l1 := render(bg, w,
 		seg{t: " "},
 		seg{t: " " + ini + " ", fg: "#FFFFFF", bg: avBg, bold: true}, // 4x2 avatar block
@@ -2422,9 +2643,9 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 	}
 	pin, pinW := "", 0
 	if m.pinned[c.JID] {
-		pin, pinW = "📌", 2
+		pin, pinW = uiIcon2("pin"), 2
 	}
-	rightW := runewidth.StringWidth(badge) + pinW
+	rightW := sw(badge) + pinW
 	if badge != "" && pin != "" {
 		rightW++ // space between badge and pin
 	}
@@ -2437,9 +2658,9 @@ func (m *tuiModel) listItem(c Chat, selected bool, w int) (string, string) {
 		draftPfx = "Draft: " // unsent text, in red
 		pvText = strings.ReplaceAll(clean(d), "\n", " ")
 	}
-	pfxW := runewidth.StringWidth(draftPfx)
+	pfxW := sw(draftPfx)
 	pv := trunc(pvText, max(1, w-listIndent-pfxW-rightW-2))
-	gap2 := max(0, w-listIndent-pfxW-runewidth.StringWidth(pv)-rightW-1)
+	gap2 := max(0, w-listIndent-pfxW-sw(pv)-rightW-1)
 	l2 := render(bg, w,
 		seg{t: " "},
 		seg{t: "    ", bg: avBg}, // second row of the avatar block
@@ -2466,8 +2687,8 @@ const cardIndent = 9
 // the middle row carries the initials.
 func avatarRows(name string, avBg lipgloss.Color) [3]seg {
 	ini := initials(name)
-	ini = runewidth.Truncate(ini, 2, "")
-	iw := runewidth.StringWidth(ini)
+	ini = truncW(ini, 2, "")
+	iw := sw(ini)
 	l := (6 - iw) / 2
 	return [3]seg{
 		{t: spaces(6), bg: avBg},
@@ -2488,13 +2709,13 @@ func (m *tuiModel) listCard(c Chat, selected bool, w int) [itemRows]string {
 
 	// row 0: name ............ time
 	tm := listTime(c.LastTS)
-	tmW := runewidth.StringWidth(tm)
+	tmW := sw(tm)
 	tmFg := th.dim
 	if c.Unread > 0 {
 		tmFg = th.accent
 	}
 	nm := trunc(name, max(1, w-cardIndent-tmW-2))
-	gap := max(1, w-cardIndent-runewidth.StringWidth(nm)-tmW-1)
+	gap := max(1, w-cardIndent-sw(nm)-tmW-1)
 	l0 := render(bg, w,
 		seg{t: " "}, av[0], seg{t: "  "},
 		seg{t: nm, fg: th.text, bold: true},
@@ -2511,7 +2732,7 @@ func (m *tuiModel) listCard(c Chat, selected bool, w int) [itemRows]string {
 	}
 	badgeW := 0
 	if badge != "" {
-		badgeW = runewidth.StringWidth(badge) + 2 // soft caps on both sides
+		badgeW = sw(badge) + 2 // soft caps on both sides
 	}
 	pinW := 0
 	if m.pinned[c.JID] {
@@ -2533,9 +2754,9 @@ func (m *tuiModel) listCard(c Chat, selected bool, w int) [itemRows]string {
 		draftPfx = "Draft: " // unsent text, in red
 		pvText = strings.ReplaceAll(clean(d), "\n", " ")
 	}
-	pfxW := runewidth.StringWidth(draftPfx)
+	pfxW := sw(draftPfx)
 	pv := trunc(pvText, max(1, w-cardIndent-pfxW-rightW-2))
-	gap2 := max(0, w-cardIndent-pfxW-runewidth.StringWidth(pv)-rightW-1)
+	gap2 := max(0, w-cardIndent-pfxW-sw(pv)-rightW-1)
 	tail := []seg{}
 	if badgeW > 0 {
 		tail = append(tail,
@@ -2547,7 +2768,7 @@ func (m *tuiModel) listCard(c Chat, selected bool, w int) [itemRows]string {
 		tail = append(tail, seg{t: " "})
 	}
 	if pinW > 0 {
-		tail = append(tail, seg{t: "📌", fg: th.dim})
+		tail = append(tail, seg{t: uiIcon2("pin"), fg: th.dim})
 	}
 	segs := []seg{
 		{t: " "}, av[1], {t: "  "},
@@ -2586,12 +2807,12 @@ func (m *tuiModel) chatHeader(w int) string {
 		lead = " ‹ "
 	}
 	right := presSeg(m.pres, m.typing)
-	rw := runewidth.StringWidth(right.t)
+	rw := sw(right.t)
 	if rw > 0 {
 		rw++ // trailing space
 	}
-	name := trunc(clean(m.curName), max(1, w-runewidth.StringWidth(lead)-3-rw-1))
-	av := runewidth.FillRight(runewidth.Truncate(initials(m.curName), 2, ""), 2)
+	name := trunc(clean(m.curName), max(1, w-sw(lead)-3-rw-1))
+	av := fillRightW(truncW(initials(m.curName), 2, ""), 2)
 	left := []seg{
 		{t: lead, fg: th.accent, bold: true},
 		{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(m.cur, len(avatarBgs))], bold: true},
@@ -2637,10 +2858,15 @@ func (m *tuiModel) contextRow(w int) string {
 		return one(fg, m.status)
 	case len(m.lines) > 0 && m.selMsg < 0:
 		return one(th.accent, fmt.Sprintf("📋 %d lines pasted · sends as ONE message · Enter sends · ⌫ edits", len(m.lines)+1))
+	case m.selMsg >= 0 && strings.HasSuffix(m.cur, "@newsletter"):
+		return hintRow(w, "g", "save", "Esc", "back")
 	case m.selMsg >= 0:
 		return hintRow(w, "r", "reply", "e", "edit", "d", "del", "g", "save", "+", "react", "Esc", "back")
 	case m.scroll > 0:
 		return one(th.accent, "↓ scrolled up — press End for latest")
+	}
+	if strings.HasSuffix(m.cur, "@newsletter") {
+		return hintRow(w, "↑ ↓", "scroll", "tap", "pick a post")
 	}
 	return hintRow(w, "↑", "pick message", "/file", "send file", "/help", "help")
 }
@@ -2660,7 +2886,11 @@ func (m *tuiModel) renderChat(w, h int) []string {
 			}
 		}
 	} else if len(m.msgs) == 0 {
-		rows[avail/2+1] = bgr(w, seg{t: trunc("   No messages yet — say hi 👋", w), fg: th.dim})
+		if strings.HasSuffix(m.cur, "@newsletter") {
+			rows[avail/2+1] = bgr(w, seg{t: trunc("   No updates yet", w), fg: th.dim})
+		} else {
+			rows[avail/2+1] = bgr(w, seg{t: trunc("   No messages yet — say hi 👋", w), fg: th.dim})
+		}
 	} else {
 		lay := m.layoutMsgs(w)
 		lines := lay.lines
@@ -2686,7 +2916,9 @@ func (m *tuiModel) renderChat(w, h int) []string {
 		}
 	}
 	rows[h-2] = m.contextRow(w)
-	if m.cur != "" {
+	if strings.HasSuffix(m.cur, "@newsletter") {
+		rows[h-1] = render(th.bar, w, seg{t: trunc(" "+uiIcon("channels")+"  Channel updates · read only", w), fg: th.dim})
+	} else if m.cur != "" {
 		v := m.input.View()
 		if pad := w - lipgloss.Width(v); pad > 0 {
 			v += blankRow(pad)
@@ -2725,7 +2957,11 @@ func (m *tuiModel) layoutMsgs(w int) msgLayout {
 			lay.lines = append(lay.lines, blankRow(w)) // one empty row between every two messages
 		}
 		lay.start[i] = len(lay.lines)
-		lay.lines = append(lay.lines, m.bubble(mm, w, group, i == m.selMsg, tail, byID)...)
+		if strings.HasSuffix(m.cur, "@newsletter") { // channel: posts, not chat bubbles
+			lay.lines = append(lay.lines, m.post(mm, w, i == m.selMsg)...)
+		} else {
+			lay.lines = append(lay.lines, m.bubble(mm, w, group, i == m.selMsg, tail, byID)...)
+		}
 		lay.end[i] = len(lay.lines)
 		prevSender, prevTS = mm.Sender, mm.TS
 	}
@@ -2735,7 +2971,7 @@ func (m *tuiModel) layoutMsgs(w int) msgLayout {
 func centerPill(text string, w int) string {
 	t := " " + text + " "
 	return bgr(w,
-		seg{t: spaces((w - runewidth.StringWidth(t)) / 2)},
+		seg{t: spaces((w - sw(t)) / 2)},
 		seg{t: t, fg: th.dim, bg: th.pill})
 }
 
@@ -2877,6 +3113,89 @@ func (m *tuiModel) bubble(mm Message, w int, group, selected, tail bool, byID ma
 	return out
 }
 
+// post draws one channel update as a centred card (channels are broadcasts, not chats):
+//
+//	  ┌──────────────────────────┐
+//	  │ 📢 Channel name          │
+//	  │ ──────────────────────── │
+//	  │ The update text, wrapped │
+//	  │ inside the card.         │
+//	  │                    12:30 │
+//	  └──────────────────────────┘
+//
+// Like bubbles, the card is plain background-coloured cells (no block glyphs).
+func (m *tuiModel) post(mm Message, w int, selected bool) []string {
+	cw := clamp(w-4, 16, 46)
+	inner := cw - 4
+	bb := th.them
+
+	var rows [][]seg
+	rows = append(rows,
+		[]seg{{t: trunc(uiIcon("channels")+" "+clean(m.curName), inner), fg: th.accent, bold: true}},
+		[]seg{{t: strings.Repeat("─", inner), fg: th.dim}})
+
+	body := clean(mm.Text)
+	bodyFg := th.text
+	switch {
+	case mm.Deleted:
+		body, bodyFg = "🚫 This update was deleted", th.dim
+	case kindLabel(mm) != "":
+		if body != "" {
+			body = kindLabel(mm) + "\n" + body
+		} else {
+			body = kindLabel(mm)
+		}
+	}
+	if body != "" {
+		for _, l := range wrapText(body, inner) {
+			rows = append(rows, []seg{{t: l, fg: bodyFg, ital: mm.Deleted}})
+		}
+	}
+	if mm.Reactions != "" {
+		rows = append(rows, []seg{{t: " "}}, []seg{{t: trunc(mm.Reactions, inner)}})
+	}
+	foot := time.Unix(mm.TS, 0).Format("15:04")
+	if mm.Edited && !mm.Deleted {
+		foot = "edited " + foot
+	}
+	rows = append(rows, []seg{{t: spaces(max(0, inner-sw(foot)))}, {t: foot, fg: th.dim}})
+
+	pad := seg{t: spaces(cw), bg: bb}
+	cores := [][]seg{{pad}}
+	for _, r := range rows {
+		line := []seg{{t: "  ", bg: bb}}
+		for _, s := range r {
+			if s.bg == "" {
+				s.bg = bb
+			}
+			if s.fg == "" {
+				s.fg = th.text
+			}
+			line = append(line, s)
+		}
+		if rw := segsWidth(r); rw < inner {
+			line = append(line, seg{t: spaces(inner - rw), bg: bb})
+		}
+		line = append(line, seg{t: "  ", bg: bb})
+		cores = append(cores, line)
+	}
+	cores = append(cores, []seg{pad})
+
+	lead := max(1, (w-cw)/2)
+	out := make([]string, 0, len(cores))
+	for _, core := range cores {
+		var segs []seg
+		if selected {
+			segs = append(segs, seg{t: spaces(lead - 1)}, seg{t: " ", bg: th.accent})
+		} else {
+			segs = append(segs, seg{t: spaces(lead)})
+		}
+		segs = append(segs, core...)
+		out = append(out, render(th.bg, w, segs...))
+	}
+	return out
+}
+
 // ================================================================ home dashboard
 
 type dashHit struct {
@@ -2903,9 +3222,9 @@ var dashLogoSmall = []string{"╦ ╦╔═╗╔═╗╦  ╦", "║║║╠�
 
 // padCenter centres s inside w columns (cut to w if it is longer).
 func padCenter(s string, w int) string {
-	n := runewidth.StringWidth(s)
+	n := sw(s)
 	if n >= w {
-		return runewidth.Truncate(s, w, "")
+		return truncW(s, w, "")
 	}
 	l := (w - n) / 2
 	return spaces(l) + s + spaces(w-n-l)
@@ -3089,15 +3408,15 @@ func (m *tuiModel) dashLines(w int) []string {
 		if c.Unread > 0 {
 			badge = " " + unreadLabel(c.Unread) + " "
 		}
-		bw := runewidth.StringWidth(badge)
+		bw := sw(badge)
 		tm := listTime(c.LastTS)
-		tw := runewidth.StringWidth(tm)
+		tw := sw(tm)
 		right := bw + tw
 		if bw > 0 && tw > 0 {
 			right++
 		}
 		nm := trunc(clean(c.Title()), max(1, cw-3-right-1))
-		gap := max(1, cw-3-runewidth.StringWidth(nm)-right)
+		gap := max(1, cw-3-sw(nm)-right)
 		segs := []seg{
 			{t: " ▸ ", fg: th.accent},
 			{t: nm, fg: th.text, bold: c.Unread > 0},
@@ -3130,7 +3449,7 @@ func (m *tuiModel) dashLines(w int) []string {
 			bsegs = append(bsegs, seg{t: "  "})
 			bx += 2
 		}
-		wd := runewidth.StringWidth(" " + b.key + " " + b.label + " ")
+		wd := sw(" " + b.key + " " + b.label + " ")
 		bsegs = append(bsegs,
 			seg{t: " " + b.key, fg: th.accent, bg: th.sel, bold: true},
 			seg{t: " " + b.label + " ", fg: th.text, bg: th.sel})
@@ -3517,14 +3836,14 @@ func (m *tuiModel) resItem(r searchRes, selected bool, w int) (string, string) {
 		bg = th.sel
 	}
 	name := clean(r.title)
-	av := runewidth.FillRight(runewidth.Truncate(initials(strings.TrimPrefix(name, "+")), 2, ""), 2)
+	av := fillRightW(truncW(initials(strings.TrimPrefix(name, "+")), 2, ""), 2)
 	tm := listTime(r.ts)
 	if r.kind == 1 {
 		tm = "contact"
 	}
-	tmW := runewidth.StringWidth(tm)
+	tmW := sw(tm)
 	nm := trunc(name, max(1, w-5-tmW-1))
-	gap := max(1, w-4-runewidth.StringWidth(nm)-tmW-1)
+	gap := max(1, w-4-sw(nm)-tmW-1)
 	l1 := render(bg, w,
 		seg{t: " "},
 		seg{t: av, fg: "#FFFFFF", bg: avatarBgs[hashIdx(r.jid, len(avatarBgs))], bold: true},
@@ -3541,7 +3860,7 @@ func (m *tuiModel) resItem(r searchRes, selected bool, w int) (string, string) {
 	l2 := render(bg, w,
 		seg{t: "    "},
 		seg{t: prefix, fg: th.accent},
-		seg{t: trunc(sub, max(1, w-5-runewidth.StringWidth(prefix))), fg: th.dim},
+		seg{t: trunc(sub, max(1, w-5-sw(prefix))), fg: th.dim},
 	)
 	return l1, l2
 }
@@ -3602,11 +3921,11 @@ func truncLeft(s string, w int) string {
 	if w <= 0 {
 		return ""
 	}
-	if runewidth.StringWidth(s) <= w {
+	if sw(s) <= w {
 		return s
 	}
 	r := []rune(s)
-	for len(r) > 0 && runewidth.StringWidth("…"+string(r)) > w {
+	for len(r) > 0 && sw("…"+string(r)) > w {
 		r = r[1:]
 	}
 	return "…" + string(r)
@@ -3646,12 +3965,48 @@ func openWithDefault(path string) error {
 }
 
 func (m *tuiModel) openFiles() tea.Cmd {
+	m.showFileSheet = false
+	m.fMode = 0
 	m.showFiles = true
 	m.fStage = 0
 	m.ffilter.SetValue("")
 	m.ffilter.Blur()
 	m.loadFileDir(filesStartDir(), "")
 	return nil
+}
+
+// openPhotos opens the same browser, but it lists only pictures (folders stay for navigation),
+// starting in the camera / gallery folder when Termux storage is set up.
+func (m *tuiModel) openPhotos() tea.Cmd {
+	m.showFileSheet = false
+	m.fMode = 1
+	m.showFiles = true
+	m.fStage = 0
+	m.ffilter.SetValue("")
+	m.ffilter.Blur()
+	m.loadFileDir(photosStartDir(), "")
+	return nil
+}
+
+func photosStartDir() string {
+	h := homeDir()
+	for _, p := range []string{
+		h + "/storage/dcim/Camera", h + "/storage/dcim", h + "/storage/pictures",
+		h + "/storage/shared/DCIM/Camera", h + "/storage/shared/DCIM", h + "/storage/shared/Pictures",
+	} {
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			return p
+		}
+	}
+	return filesStartDir()
+}
+
+func isPhoto(name string) bool {
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".heic":
+		return true
+	}
+	return false
 }
 
 func (m *tuiModel) closeFiles() {
@@ -3687,6 +4042,9 @@ func (m *tuiModel) loadFileDir(dir, focus string) {
 			continue
 		}
 		it := fileItem{name: name, path: p, dir: st.IsDir(), size: st.Size(), mod: st.ModTime()}
+		if m.fMode == 1 && !it.dir && !isPhoto(name) {
+			continue // photos mode: pictures only
+		}
 		if it.dir {
 			dirs = append(dirs, it)
 		} else {
@@ -3990,7 +4348,7 @@ func (m *tuiModel) fileRow(it fileItem, selected bool, w int) (string, string) {
 	if selected {
 		bg = th.sel
 	}
-	icon, sub := "📁", "folder"
+	icon, sub := uiIcon2("folder"), "folder"
 	switch {
 	case it.up:
 		icon, sub = "↑ ", "parent folder"
@@ -4024,7 +4382,11 @@ func (m *tuiModel) statusOrHint(w int, pairs ...string) string {
 }
 
 func (m *tuiModel) drawFileList(rows []string, w, h int) {
-	rows[0] = render(th.bar, w, seg{t: " ‹ Files", fg: th.accent, bold: true})
+	title := " ‹ Files"
+	if m.fMode == 1 {
+		title = " ‹ Photos"
+	}
+	rows[0] = render(th.bar, w, seg{t: title, fg: th.accent, bold: true})
 	rows[1] = bgr(w, seg{t: " " + truncLeft(shortPath(m.fDir), max(1, w-2)), fg: th.dim})
 	perPage, top := m.fileGeom(h)
 	for i := 0; i < perPage; i++ {
@@ -4058,7 +4420,7 @@ func (m *tuiModel) drawButton(rows []string, y, w int, label string, primary boo
 		bg, fg = th.sel, th.text
 	}
 	inner := max(1, w-2)
-	t := runewidth.FillRight(trunc("  "+label, inner), inner)
+	t := fillRightW(trunc("  "+label, inner), inner)
 	if y >= 0 && y < len(rows) {
 		rows[y] = render(th.bg, w, seg{t: " "}, seg{t: t, fg: fg, bg: bg, bold: true})
 	}
@@ -4115,4 +4477,159 @@ func (m *tuiModel) drawFileConfirm(rows []string, w, h int) {
 	m.drawButton(rows, fConfY[0], w, "✓  Send", true)
 	m.drawButton(rows, fConfY[1], w, "✕  Cancel", false)
 	rows[h-1] = hintRow(w, "⏎", "send", "Esc", "back")
+}
+
+
+// ================================================================ settings screen (⚙)
+
+type setItem struct{ label, desc, val string }
+
+func curThemeName() string {
+	for _, n := range themeNames() {
+		if themes[n] == th {
+			return n
+		}
+	}
+	return "custom"
+}
+
+func (m *tuiModel) settingsItems() []setItem {
+	c := loadConfig()
+	onoff := func(b bool) string {
+		if b {
+			return "ON"
+		}
+		return "OFF"
+	}
+	style := "Emoji"
+	if roundCaps {
+		style = "Nerd Font"
+	}
+	return []setItem{
+		{"Theme", "tap to switch colours", curThemeName()},
+		{"Notifications", "Termux notifications from the daemon", onoff(c.Notifications)},
+		{"Read receipts", "send blue ticks when you open a chat", onoff(c.SendReceipts)},
+		{"Typing indicator", "let others see when you type", onoff(c.SendTyping)},
+		{"Icon style", "Nerd Font = rounded pills + font icons", style},
+		{"Download folder", c.DownloadDir, ""},
+	}
+}
+
+func (m *tuiModel) toggleSetting(i int) {
+	c := loadConfig()
+	switch i {
+	case 0:
+		m.cycleTheme()
+		return
+	case 1:
+		c.Notifications = !c.Notifications
+	case 2:
+		c.SendReceipts = !c.SendReceipts
+	case 3:
+		c.SendTyping = !c.SendTyping
+	case 4:
+		c.RoundedCaps = !c.RoundedCaps
+		roundCaps = c.RoundedCaps
+		for _, ti := range []*textinput.Model{&m.filter, &m.cfilter, &m.ffilter} {
+			ti.Prompt = uiIcon("search") + " "
+		}
+	default:
+		return
+	}
+	_ = c.Save()
+}
+
+func (m *tuiModel) onSettingsKey(k tea.KeyMsg) (tea.Model, tea.Cmd) {
+	n := len(m.settingsItems())
+	switch k.String() {
+	case "esc", "q", "left", "h":
+		m.showSettings = false
+	case "up", "k":
+		m.setSel = (m.setSel + n - 1) % n
+	case "down", "j":
+		m.setSel = (m.setSel + 1) % n
+	case "enter", " ", "right", "l":
+		m.toggleSetting(m.setSel)
+	}
+	return m, nil
+}
+
+// renderSettings: row 0 title bar, rows 2.. three rows per setting (label + value, hint, gap).
+func (m *tuiModel) renderSettings() string {
+	w, h := m.w, m.h
+	rows := make([]string, 0, h)
+	rows = append(rows, render(th.bg, w,
+		seg{t: "═╡", fg: th.accent},
+		seg{t: " " + uiIcon2("gear") + " Settings ", fg: th.text, bold: true},
+		seg{t: "╞" + strings.Repeat("═", max(0, w-17)), fg: th.accent}))
+	rows = append(rows, blankRow(w))
+	for i, it := range m.settingsItems() {
+		bg := th.bg
+		if i == m.setSel {
+			bg = th.sel
+		}
+		valFg := th.accent
+		if it.val == "OFF" {
+			valFg = th.dim
+		}
+		vw := sw(it.val)
+		lw := max(1, w-3-vw)
+		rows = append(rows,
+			render(bg, w, seg{t: " " + trunc(it.label, lw), fg: th.text, bold: true},
+				seg{t: spaces(max(1, w-1-sw(trunc(it.label, lw))-1-vw-1))},
+				seg{t: it.val + " ", fg: valFg, bold: true}),
+			render(bg, w, seg{t: " " + trunc(it.desc, max(1, w-2)), fg: th.dim}),
+			blankRow(w))
+	}
+	for len(rows) < h-navRows {
+		rows = append(rows, blankRow(w))
+	}
+	ic, lb := m.navBar(w)
+	rows = append(rows[:h-navRows], ic, lb)
+	return strings.Join(rows, "\n")
+}
+
+
+// ================================================================ file chooser sheet
+
+const sheetH = 8
+
+func (m *tuiModel) openFileSheet() tea.Cmd {
+	m.showFileSheet = true
+	m.sheetSel = 0
+	return nil
+}
+
+// overlaySheet draws the small bottom sheet over the already rendered screen:
+//
+//	════════════  (accent line)
+//	 Send or open from
+//	 📷 Photos       pictures from your gallery
+//	 📁 Files        everything in your storage
+//	          Cancel
+func (m *tuiModel) overlaySheet(base string) string {
+	w := m.w
+	rows := strings.Split(base, "\n")
+	if len(rows) < sheetH+2 {
+		return base
+	}
+	opt := func(i int, ic, label, hint string) (string, string) {
+		bg := th.bar
+		if m.sheetSel == i {
+			bg = th.sel
+		}
+		return render(bg, w, seg{t: "  " + ic + "  " + label, fg: th.text, bold: true}),
+			render(bg, w, seg{t: "      " + trunc(hint, max(1, w-8)), fg: th.dim})
+	}
+	p1, p2 := opt(0, uiIcon2("photo"), "Photos", "pictures from your gallery")
+	f1, f2 := opt(1, uiIcon2("folder"), "Files", "everything in your storage")
+	sheet := []string{
+		render(th.bg, w, seg{t: strings.Repeat("═", w), fg: th.accent}),
+		render(th.bar, w, seg{t: " Open or send from…", fg: th.dim}),
+		p1, p2, f1, f2,
+		render(th.bar, w),
+		render(th.bar, w, seg{t: trunc("  ✕  Cancel", w), fg: th.dim}),
+	}
+	copy(rows[len(rows)-sheetH:], sheet)
+	return strings.Join(rows, "\n")
 }

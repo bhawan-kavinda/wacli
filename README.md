@@ -73,14 +73,14 @@ Also: `contacts`, `groups`, `edit`, `rm`, `read`, `presence`, `alias`, `config`.
 
 | Where | Keys |
 | --- | --- |
-| List | `j` `k` move · `Enter` open · `1`-`4` tabs · `c` contacts · `p` pin · `/` search · `t` theme · `q` quit |
+| List | `j` `k` move · `Enter` open · `1`-`4` tabs · `c` contacts · `f` photos / files · `p` pin · `/` search · `t` theme · `q` quit |
 | Chat | type + `Enter` send · `PgUp` `PgDn` scroll · `Esc` back |
 | Slash | `/r N text` · `/react N 👍` · `/edit N text` · `/del N` · `/get N` · `/file path` · `/theme` · `/help` |
-| Touch | tap chats, tabs and buttons · swipe to scroll |
+| Touch | tap chats, tabs and buttons · swipe to scroll · **Files** button opens a Photos / Files sheet, then pick an item to open or send it |
 
 ## Settings
 
-`wacli config set <key> <value>`, stored in `~/.wacli/config.json`.
+Tap **Settings**, the 5th tab of the bottom bar (or change them from the shell with `wacli config set <key> <value>`). Theme, notifications, read receipts, typing indicator and icon style can be switched on the settings screen. Stored in `~/.wacli/config.json`.
 
 | Key | Default | Meaning |
 | --- | --- | --- |
@@ -90,7 +90,7 @@ Also: `contacts`, `groups`, `edit`, `rm`, `read`, `presence`, `alias`, `config`.
 | `rounded_caps` | `false` | Rounded pills, needs a Nerd Font |
 | `download_dir` | `~/storage/downloads/wacli` | Media folder |
 
-**Rounded pills:** install a Nerd Font (`cp YourNerdFont.ttf ~/.termux/font.ttf && termux-reload-settings`), then `wacli config set rounded_caps true`. Without that font they show as empty boxes.
+**Nerd Font mode:** turns the search box, chips and badges into smooth rounded pills and shows real font icons (gear, tabs, pin, folder). Without it, matching emoji are used (🔍 💬 👥 📢 🔔 📌 📁). Install a Nerd Font (`cp YourNerdFont.ttf ~/.termux/font.ttf && termux-reload-settings`), then `wacli config set rounded_caps true`. Without that font the icons show as empty boxes, so keep it off.
 Other options: `WACLI_ROUNDED=1` (one run), `WACLI_256=1` (own colour profile), `WACLI_DEBUG=1`, `WACLI_HOME=<dir>`.
 
 ## Security
